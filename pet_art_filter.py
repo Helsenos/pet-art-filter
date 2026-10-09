@@ -1089,107 +1089,6 @@ def gem_image():
         return None
 
 
-class Intro:
-    """Boot animation that continues the .exe's loading picture (splash.png): it starts as
-    exactly that picture, then the gem comes alive - a pulse, a ring of light, sparkles -
-    'loading...' turns into the version, and the app window fades in."""
-    GEM_C, GEM = (210, 114), 120          # gem centre and size in splash.png
-
-    def __init__(self, root, on_done):
-        from PIL import ImageTk, ImageDraw, ImageFont
-        self.root, self.on_done = root, on_done
-        base = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "splash.png")
-        splash = Image.open(base).convert("RGB")
-        gem = gem_image()
-        self.W, self.H = splash.size
-        self.win = w = tk.Toplevel(root)
-        w.overrideredirect(True)
-        w.attributes("-topmost", True)
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        w.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+{(sh - self.H) // 2}")   # where the splash was
-        self.cv = cv = tk.Canvas(w, width=self.W, height=self.H, highlightthickness=0, bd=0)
-        cv.pack()
-        self._bg = ImageTk.PhotoImage(splash)
-        cv.create_image(0, 0, anchor="nw", image=self._bg)
-        bg = "#%02x%02x%02x" % splash.getpixel((self.W // 2, self.H - 20))
-        self.bgcol = bg
-        cx, cy = self.GEM_C
-        self.ring = cv.create_oval(0, 0, 0, 0, outline=bg, width=4)
-        # the gem a little bigger at each pulse step (made once)
-        self.frames = []
-        if gem is not None:
-            for i in range(12):
-                k = math.sin(math.pi * i / 11)                       # 0 -> 1 -> 0
-                size = int(self.GEM * (1 + 0.12 * k))
-                self.frames.append(ImageTk.PhotoImage(gem.resize((size, size), Image.LANCZOS)))
-        self.gem = cv.create_image(cx, cy, image=self.frames[0] if self.frames else None)
-        self.stars = [cv.create_polygon(0, 0, 0, 0, fill=bg, outline="") for _ in range(3)]
-        # "loading..." -> the version, in the splash's own font
-        try:
-            font = ImageFont.truetype("segoeui.ttf", 14)
-        except OSError:
-            font = ImageFont.load_default()
-        sub = Image.new("RGB", (self.W - 40, 24), splash.getpixel((30, 246)))
-        d = ImageDraw.Draw(sub)
-        text = f"Metin2 · Jintea  ·  v{updater.APP_VERSION}"
-        d.text(((sub.width - d.textlength(text, font=font)) / 2, 2), text, font=font, fill=(135, 144, 165))
-        self._sub = ImageTk.PhotoImage(sub)
-        self.sub_item = None
-        self.t0 = time.perf_counter()
-        w.update()
-        self._tick()
-
-    def _star(self, item, x, y, r):
-        self.cv.coords(item, x, y - r, x + r * 0.25, y - r * 0.25, x + r, y, x + r * 0.25, y + r * 0.25,
-                       x, y + r, x - r * 0.25, y + r * 0.25, x - r, y, x - r * 0.25, y - r * 0.25)
-
-    @staticmethod
-    def _mix(a, b, t):
-        t = min(1.0, max(0.0, t))
-        ca, cb = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
-        return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
-
-    def _tick(self):
-        if not self.win.winfo_exists():
-            return
-        ms = (time.perf_counter() - self.t0) * 1000
-        cv, (cx, cy) = self.cv, self.GEM_C
-        if self.frames:                                         # one soft pulse (0 - 420 ms)
-            cv.itemconfigure(self.gem, image=self.frames[min(11, int(ms / 260 * 11))])
-        t = (ms - 30) / 340                                     # ring of light around the gem
-        if 0 <= t <= 1:
-            r = 64 + 22 * (1 - (1 - t) ** 3)
-            cv.coords(self.ring, cx - r, cy - r, cx + r, cy + r)
-            cv.itemconfigure(self.ring, outline=self._mix(ACCENT, self.bgcol, t), width=max(1, int(5 * (1 - t))))
-        else:
-            cv.coords(self.ring, 0, 0, 0, 0)
-        for k, (dx, dy, delay) in enumerate(((78, -50, 60), (-84, 34, 130), (66, 52, 200))):
-            st = (ms - delay) / 220                             # sparkles twinkle
-            r = 10 * math.sin(math.pi * min(1.0, max(0.0, st)))
-            self._star(self.stars[k], cx + dx, cy + dy, max(0.1, r))
-            cv.itemconfigure(self.stars[k], fill="#ffffff" if 0 < st < 1 else self.bgcol)
-        if ms > 120 and self.sub_item is None:                  # loaded: show the version
-            self.sub_item = cv.create_image(20, 234, anchor="nw", image=self._sub)
-        if ms < 420:
-            self.win.after(15, self._tick)
-        else:
-            self.on_done(self)
-
-    def fade_out(self, ms=160):
-        t0 = time.perf_counter()
-
-        def step():
-            if not self.win.winfo_exists():
-                return
-            t = min(1.0, (time.perf_counter() - t0) * 1000 / ms)
-            self.win.attributes("-alpha", 1 - t)
-            if t < 1:
-                self.win.after(15, step)
-            else:
-                self.win.destroy()
-        step()
-
-
 # ================================================================ in-game mini bar
 class MiniBar:
     """Small always-on-top bar to put next to the game's icons: start/stop, clear marks,
@@ -3692,32 +3591,10 @@ class App:
             pass
 
     def boot(self):
-        """Show the window - with the intro first when animations are on."""
+        """Show the window (the .exe's loading picture was up while the app loaded)."""
         self.root.after(50, self._set_taskbar_icon)
-        self.root.after(1500, self._set_taskbar_icon)     # once more, after the intro
-        if not self.anim_on.get():
-            self.root.deiconify()
-            return
-        try:
-            Intro(self.root, self._intro_done)
-        except Exception:
-            self.root.deiconify()
-
-    def _intro_done(self, intro):
-        """Cross-fade: the intro fades out while the app window fades in."""
-        r = self.root
-        r.attributes("-alpha", 0.0)
-        r.deiconify()
-        r.lift()
-        intro.fade_out()
-        t0 = time.perf_counter()
-
-        def step():
-            t = min(1.0, (time.perf_counter() - t0) / 0.16)
-            r.attributes("-alpha", t)
-            if t < 1:
-                r.after(15, step)
-        step()
+        self.root.after(1000, self._set_taskbar_icon)     # once more, to be sure
+        self.root.deiconify()             # straight in: the loading picture covered the wait
 
     def _close(self):
         """Closing animation: the window fades out (~0.2 s), then the app closes."""
@@ -4052,10 +3929,10 @@ if __name__ == "__main__":
     root = ctk.CTk()
     root.withdraw()                    # shown by app.boot() (after the intro)
     app = App(root)
-    app.boot()                         # the intro takes over exactly where the loading picture is
     try:
-        import pyi_splash              # ...so the loading picture can go now, without a gap
+        import pyi_splash              # the .exe's loading picture: the app is ready now
         pyi_splash.close()
     except Exception:
         pass
+    app.boot()
     root.mainloop()
