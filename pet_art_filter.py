@@ -802,65 +802,45 @@ class Overlay:
 
 
 # ================================================================ in-game mini bar
-def find_game_window():
-    """The Metin2 client window (title like "Nihor2 - Chronicles of Jinteia")."""
-    found = []
-    EnumProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-    me = os.getpid()
-
-    def cb(hwnd, _):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        pid = wt.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == me:
-            return True
-        buf = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(hwnd, buf, 256)
-        t = buf.value.lower()
-        if "jinteia" in t or "metin2" in t or "metin 2" in t:
-            found.append(hwnd)
-            return False
-        return True
-
-    user32.EnumWindows(EnumProc(cb), 0)
-    return found[0] if found else None
-
-
 class MiniBar:
-    """Small bar that sits on the game screen next to the game's own icons:
-    start/stop, clear marks, good count, open the app. Clicking it doesn't take the
-    keyboard away from the game. Drag it by the grip; the spot is remembered relative
-    to the game window's bottom-right corner."""
+    """Small always-on-top bar to put next to the game's icons: start/stop, clear marks,
+    good count, open the app. It stays exactly where you drag it (by the grip) - no
+    window tracking, nothing running in the background. Clicking it doesn't take the
+    keyboard away from the game."""
 
     KEY = "#010204"
+    STONE, WELL = "#17140f", "#0e0c09"          # game-like dark stone
+    BRONZE, BRONZE_DIM = "#9a7f4c", "#5e4d30"   # frame colours of the game's windows
+    BTN, BTN_HOVER = "#262019", "#3a3024"
+    GREEN, RED, GOLD, PARCHMENT, VIOLET = "#86df72", "#ff6b5b", "#ecc768", "#d9caa6", "#b9a2ff"
 
     def __init__(self, app):
         self.app = app
-        self.game = None
-        self.offset = tuple(app.minibar_offset) if app.minibar_offset else None
         self.win = tk.Toplevel(app.root)
         self.win.overrideredirect(True)
         self.win.configure(bg=self.KEY)
         self.win.attributes("-topmost", True)
         self.win.attributes("-transparentcolor", self.KEY)
-        bar = ctk.CTkFrame(self.win, corner_radius=19, fg_color="#14161c", bg_color=self.KEY, border_width=1,
-                           border_color="#8a7650")
+        # styled like the game's own UI: dark stone, thin bronze frame, small square icon buttons
+        bar = ctk.CTkFrame(self.win, corner_radius=4, fg_color=self.STONE, bg_color=self.KEY, border_width=2,
+                           border_color=self.BRONZE)
         bar.pack()
         f = lambda size, w="bold": ctk.CTkFont(family="Segoe UI", size=size, weight=w)  # noqa: E731
-        rb = dict(width=30, height=30, corner_radius=15, border_width=1, border_color="#5d5038",
-                  font=f(13), text_color=FG)
-        self.go = ctk.CTkButton(bar, text="▶", fg_color=ACCENT, hover_color=ACCENT_H,
-                                command=app._toggle, **rb)
-        self.go.pack(side="left", padx=(5, 3), pady=4)
-        ctk.CTkButton(bar, text="✕", fg_color=CARD2, hover_color=BORDER, command=app._clear_marks,
-                      **rb).pack(side="left", padx=3, pady=4)
-        self.count = ctk.CTkLabel(bar, text="✦ 0", font=f(13), text_color=GOOD, width=44)
-        self.count.pack(side="left", padx=(4, 2))
-        ctk.CTkButton(bar, text="◆", fg_color=CARD2, hover_color=BORDER, command=self._open_app,
-                      **rb).pack(side="left", padx=3, pady=4)
-        grip = ctk.CTkLabel(bar, text="⣿", font=f(14, "normal"), text_color=MUTED, width=16, cursor="fleur")
-        grip.pack(side="left", padx=(2, 8))
+        rb = dict(width=28, height=28, corner_radius=3, border_width=1, border_color=self.BRONZE_DIM,
+                  fg_color=self.BTN, hover_color=self.BTN_HOVER, font=f(14))
+        self.go = ctk.CTkButton(bar, text="▶", text_color=self.GREEN, command=app._toggle, **rb)
+        self.go.pack(side="left", padx=(5, 2), pady=5)
+        ctk.CTkButton(bar, text="✕", text_color=self.PARCHMENT, command=app._clear_marks,
+                      **rb).pack(side="left", padx=2, pady=5)
+        well = ctk.CTkFrame(bar, corner_radius=3, fg_color=self.WELL, border_width=1, border_color=self.BRONZE_DIM,
+                            height=28)
+        well.pack(side="left", padx=2, pady=5)
+        self.count = ctk.CTkLabel(well, text="✦ 0", font=f(13), text_color=self.GOLD, width=46, height=24)
+        self.count.pack(padx=3, pady=1)
+        ctk.CTkButton(bar, text="◆", text_color=self.VIOLET, command=self._open_app,
+                      **rb).pack(side="left", padx=2, pady=5)
+        grip = ctk.CTkLabel(bar, text="⋮⋮", font=f(13), text_color=self.BRONZE, width=14, cursor="fleur")
+        grip.pack(side="left", padx=(3, 7))
         grip.bind("<ButtonPress-1>", self._drag_start)
         grip.bind("<B1-Motion>", self._drag_move)
         grip.bind("<ButtonRelease-1>", self._drag_end)
@@ -869,11 +849,20 @@ class MiniBar:
         ex = user32.GetWindowLongW(self.hwnd, -20)
         # no-activate (game keeps the keyboard) | toolwindow (no taskbar button)
         user32.SetWindowLongW(self.hwnd, -20, ex | 0x08000000 | 0x80)
-        self.shown = True
         self._drag = None
-        self.win.withdraw()
-        self.shown = False
-        self._follow()
+        pos = app.minibar_pos
+        if not pos:     # first start: bottom right, just left of where the game's icon row usually is
+            sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+            pos = (sw - 352 - self.win.winfo_reqwidth(), sh - 48 - self.win.winfo_reqheight() - 1)
+        self.win.geometry(f"+{int(pos[0])}+{int(pos[1])}")
+        self.show(app.minibar_on.get())
+
+    def show(self, on):
+        if on:
+            self.win.deiconify()
+            self.win.attributes("-topmost", True)
+        else:
+            self.win.withdraw()
 
     def set_capture_mode(self, hide_from_capture):
         try:
@@ -882,8 +871,8 @@ class MiniBar:
             pass
 
     def update(self, scanning, good):
-        self.go.configure(text="■" if scanning else "▶", fg_color=BAD if scanning else ACCENT,
-                          hover_color="#e25c5c" if scanning else ACCENT_H)
+        self.go.configure(text="■" if scanning else "▶", text_color=self.RED if scanning else self.GREEN,
+                          border_color=self.RED if scanning else self.BRONZE_DIM)
         self.count.configure(text=f"✦ {good}")
 
     def _open_app(self):
@@ -891,51 +880,6 @@ class MiniBar:
         r.deiconify()
         r.lift()
         r.focus_force()
-
-    def _game_corner(self):
-        """Bottom-right corner of the game's picture area in screen pixels, or None."""
-        if not self.game or not user32.IsWindow(self.game):
-            self.game = find_game_window()
-        if not self.game or user32.IsIconic(self.game):
-            return None
-        rc = wt.RECT()
-        user32.GetClientRect(self.game, ctypes.byref(rc))
-        pt = wt.POINT(rc.right, rc.bottom)
-        user32.ClientToScreen(self.game, ctypes.byref(pt))
-        return pt.x, pt.y
-
-    def _follow(self):
-        try:
-            self._place()
-        except tk.TclError:
-            return
-        except Exception:
-            pass
-        self.win.after(400, self._follow)
-
-    def _place(self):
-        if self._drag:
-            return
-        want = self.app.minibar_on.get()
-        corner = self._game_corner() if want else None
-        fg = user32.GetForegroundWindow()
-        pid = wt.DWORD()
-        user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
-        ours_or_game = fg == self.game or pid.value == os.getpid()
-        if corner is None or not ours_or_game:
-            if self.shown:
-                self.win.withdraw()
-                self.shown = False
-            return
-        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        if self.offset is None:     # default: just left of the game's icon row, bottom right
-            self.offset = (-352 - w, -h - 1)
-        x, y = corner[0] + self.offset[0], corner[1] + self.offset[1]
-        self.win.geometry(f"+{int(x)}+{int(y)}")
-        if not self.shown:
-            self.win.deiconify()
-            self.shown = True
-        self.win.attributes("-topmost", True)
 
     def _drag_start(self, e):
         self._drag = (e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y())
@@ -946,11 +890,8 @@ class MiniBar:
 
     def _drag_end(self, e):
         self._drag = None
-        corner = self._game_corner()
-        if corner:
-            self.offset = (self.win.winfo_x() - corner[0], self.win.winfo_y() - corner[1])
-            self.app.minibar_offset = list(self.offset)
-            self.app._save()
+        self.app.minibar_pos = [self.win.winfo_x(), self.win.winfo_y()]
+        self.app._save()
 
 
 # ================================================================ click picker
@@ -1063,7 +1004,7 @@ class App:
         self.on_top = tk.BooleanVar(value=False)
         self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
         self.minibar_on = tk.BooleanVar(value=True)   # small bar on the game screen
-        self.minibar_offset = None
+        self.minibar_pos = None
         self.market_match = tk.BooleanVar(value=False)
         self.seller = ""
         self.contact = ""
@@ -2122,12 +2063,13 @@ class App:
         ctk.CTkSwitch(rc, text="Screen-recording friendly", variable=self.rec_mode, progress_color=ACCENT,
                       font=self.f(13), text_color=FG, command=self._set_rec_mode).pack(anchor="w", padx=18, pady=(4, 16))
 
-        mb = self._card(pg, "In-game mini bar", "A small bar on the game screen next to the game’s icons: "
-                        "▶ start/stop, ✕ clear marks, ✦ good count, ◆ open this window. Drag "
-                        "it by ⣿ to move it. It only shows while the game is in front.")
+        mb = self._card(pg, "Mini bar", "A small always-on-top bar for the game screen: ▶ start/stop, "
+                        "✕ clear marks, ✦ good count, ◆ open this window. Drag it by ⣿ to "
+                        "wherever you like (e.g. next to the game’s icons) – it stays there.")
         mb.pack(fill="x", padx=28, pady=(0, 16))
-        ctk.CTkSwitch(mb, text="Show the mini bar on the game screen", variable=self.minibar_on,
-                      progress_color=ACCENT, font=self.f(13), text_color=FG, command=self._save
+        ctk.CTkSwitch(mb, text="Show the mini bar", variable=self.minibar_on, progress_color=ACCENT,
+                      font=self.f(13), text_color=FG,
+                      command=lambda: (self.minibar.show(self.minibar_on.get()), self._save())
                       ).pack(anchor="w", padx=18, pady=(4, 16))
 
         lc = self._card(pg, "Font memory", "The app learns your game’s font while you hover. "
@@ -2165,7 +2107,7 @@ class App:
             if key in cfg:
                 var.set(cfg[key])
         self.grids = cfg.get("grids", [])
-        self.minibar_offset = cfg.get("minibar_offset")
+        self.minibar_pos = cfg.get("minibar_pos")
         self.official = cfg.get("official_cache", [])
         self.official_on = cfg.get("official_on", {})
         self.seller, self.contact = cfg.get("seller", ""), cfg.get("contact", "")
@@ -2207,7 +2149,7 @@ class App:
         cfg["grids"] = self.grids
         cfg["bonuses"] = {n: {"mode": m.get(), "min": self._int(v, BONUSES[n][0])}
                           for n, (m, v) in self.vars.items()}
-        cfg["minibar_offset"] = self.minibar_offset
+        cfg["minibar_pos"] = self.minibar_pos
         cfg["profiles"] = self.profiles
         cfg["current"] = self.current
         cfg["official_on"] = self.official_on
