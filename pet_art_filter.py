@@ -198,6 +198,29 @@ _re_hex = re.compile(r"^#[0-9a-fA-F]{6}$")
 _SAFE = {}
 
 
+def gear_icon(color, size=18):
+    """A clean gear drawn with PIL (8 teeth, round hole), as a CTkImage."""
+    from PIL import ImageDraw
+    S = size * 8
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    c = S / 2
+    r_out, r_body, r_hole = S * 0.48, S * 0.36, S * 0.15
+    pts = []
+    for i in range(8):
+        a0 = math.radians(i * 45)
+        for da, r in ((-13, r_body), (-9, r_out), (9, r_out), (13, r_body)):
+            a = a0 + math.radians(da)
+            pts.append((c + r * math.cos(a), c + r * math.sin(a)))
+        a = a0 + math.radians(22.5)
+        pts.append((c + r_body * math.cos(a), c + r_body * math.sin(a)))
+    d.polygon(pts, fill=color)
+    d.ellipse((c - r_body, c - r_body, c + r_body, c + r_body), fill=color)
+    d.ellipse((c - r_hole, c - r_hole, c + r_hole, c + r_hole), fill=(0, 0, 0, 0))
+    im = im.resize((size * 2, size * 2), Image.LANCZOS)
+    return ctk.CTkImage(light_image=im, dark_image=im, size=(size, size))
+
+
 def safe_color(col):
     """The overlay is visible in screenshots (so screen recorders work), therefore it must
     never use a colour the reader treats as tooltip text. Such colours are shifted a few
@@ -1135,10 +1158,6 @@ class App:
                      height=22, anchor="w").pack(anchor="w")
         ctk.CTkLabel(tb, text=f"Metin2  ·  Jintea  ·  v{updater.APP_VERSION}", font=self.f(12),
                      text_color=MUTED, height=16, anchor="w").pack(anchor="w")
-        self.cog = ctk.CTkButton(side, text="⚙", width=30, height=30, corner_radius=9, fg_color="transparent",
-                                 hover_color=CARD2, text_color=MUTED, font=self.f(17),
-                                 command=lambda: self._show_page("settings"))
-        self.cog.place(relx=1.0, x=-8, y=8, anchor="ne")   # small cogwheel in the sidebar's top-right corner
 
         ctk.CTkLabel(side, text="MENU", font=self.f(11, "bold"), text_color=MUTED, anchor="w"
                      ).pack(fill="x", padx=26, pady=(0, 6))
@@ -1150,6 +1169,14 @@ class App:
                               font=self.f(14, "bold"), command=lambda k=key: self._show_page(k))
             b.pack(fill="x", padx=14, pady=3)
             self.nav[key] = b
+        # Settings: its own menu entry, a little apart from the others
+        self._gear = {"off": gear_icon(MUTED, 14), "on": gear_icon(FG, 14)}
+        ctk.CTkFrame(side, height=1, fg_color=BORDER).pack(fill="x", padx=26, pady=(10, 8))
+        self.cog = ctk.CTkButton(side, text="  Settings", image=self._gear["off"], compound="left",
+                                 anchor="w", height=44, corner_radius=12, fg_color="transparent",
+                                 hover_color=CARD2, text_color=MUTED, font=self.f(14, "bold"),
+                                 command=lambda: self._show_page("settings"))
+        self.cog.pack(fill="x", padx=14, pady=3)
 
         bottom = ctk.CTkFrame(side, fg_color="transparent")
         bottom.pack(side="bottom", fill="x", padx=14, pady=18)
@@ -1191,8 +1218,9 @@ class App:
         for k, b in self.nav.items():
             on = k == key
             b.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED)
-        self.cog.configure(fg_color=CARD2 if key == "settings" else "transparent",
-                           text_color=FG if key == "settings" else MUTED)
+        on = key == "settings"
+        self.cog.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED,
+                           image=self._gear["on" if on else "off"])
         if key == "market" and time.time() - self.market_at > 60:
             self._market_refresh()
 
