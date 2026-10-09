@@ -438,10 +438,12 @@ def _num(token):
 
 # ================================================================ the reader
 class FontReader:
-    def __init__(self, path, parse_text, bonus_range):
+    def __init__(self, path, parse_text, bonus_range, keep_text=None):
         """parse_text(text) -> [(bonus, value)] (teacher text -> bonus);
-        bonus_range(bonus) -> (lo, hi)."""
+        bonus_range(bonus) -> (lo, hi); keep_text(text) -> True for plain text worth
+        remembering (e.g. pet art names) - None keeps all."""
         self.path = path
+        self.keep_text = keep_text
         self.parse_text = parse_text
         self.bonus_range = bonus_range
         self.lock = threading.Lock()
@@ -468,7 +470,11 @@ class FontReader:
             self.glyphs = d.get("glyphs", {})
         except Exception:
             pass
-        self.clean_memory()
+        if self.clean_memory():          # something was thrown out: keep it that way
+            try:
+                self.save()
+            except Exception:
+                pass
 
     def save(self):
         with self.lock:
@@ -517,7 +523,8 @@ class FontReader:
                     self.tokens[tok] = keep
                 else:
                     self.tokens.pop(tok)
-            bad = [k for k in self.names if k[0] == "=" and self._is_bonus_text(k[1:])]
+            bad = [k for k in self.names if k[0] == "=" and (self._is_bonus_text(k[1:]) or
+                   (self.keep_text is not None and not self.keep_text(k[1:])))]
             for k in bad:
                 self.names.pop(k)
             if n or bad:
@@ -768,6 +775,8 @@ class FontReader:
             return ("bonus", (bonus, value)) if lo <= value <= hi else (None, None)
         if arts_zone or (key[0] == "=" and self._is_bonus_text(key[1:])):
             return None, None      # a bonus line the teacher misread: don't remember it as text
+        if key[0] == "=" and self.keep_text is not None and not self.keep_text(key[1:]):
+            return "text", key[1:]  # not worth remembering (e.g. another item's description)
         with self.lock:
             self._add(self.names, key, img)
         return (key, None) if key[0] == "#" else ("text", key[1:])

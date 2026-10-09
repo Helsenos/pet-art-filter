@@ -151,6 +151,12 @@ PET_TYPES = ["Candy", "Pet Perfume", "Silver Leash", "Ring of Love", "Ring of Ha
              "Hellfire Relic", "Charta Obscura", "Mark of Merlin", "Steel Collar"]
 
 
+def is_pet_name(text):
+    """True for an item name line like 'Gold Ring +0' (one of the pet art types)."""
+    base = re.sub(r"[\s,.]*\+\s*\S{0,2}\s*$", "", text or "").strip()
+    return bool(base) and bool(difflib.get_close_matches(base.title(), PET_TYPES, n=1, cutoff=0.6))
+
+
 def pet_name(text):
     """'Sllver Ring +0' -> 'Silver Ring +0': the read item name matched to the real pet art types."""
     m = re.match(r"\s*(.*?)[\s,.]*\+\s*(\d{1,2})\s*$", text or "")
@@ -1307,7 +1313,7 @@ class App:
         self._refresh_overlay()
 
         self.reader = font_reader.FontReader(
-            FONT_PATH, lambda t: parse_lines([fix_ocr(t)]), lambda b: tuple(BONUSES[b]))
+            FONT_PATH, lambda t: parse_lines([fix_ocr(t)]), lambda b: tuple(BONUSES[b]), keep_text=is_pet_name)
         for _ in range(OCR_WORKERS):
             OcrWorker(self.ocr_q, self.result_q, self.reader, careful=lambda: self._careful).start()
 
@@ -3698,7 +3704,7 @@ class App:
         self.raw.insert("end", "\n".join(pretty.get(l, l) for l in lines))
         if name:
             self.slot_names[slot] = pet_name(name)
-        name = self.slot_names.get(slot, name)
+        name = self.slot_names.get(slot, name) or "Pet art"     # a type the app hasn't learned yet
         _, rows = self.evaluate(found)
         matched = self._match_all(found)
         good = bool(matched)
