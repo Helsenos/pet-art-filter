@@ -195,6 +195,9 @@ def publish(zip_path):
 
 if __name__ == "__main__":
     t = time.time()
+    if "--install-only" in sys.argv:      # copy the last build in (seconds, no rebuild)
+        install(os.path.join(WORK, "dist", "Pet Art Filter"))
+        raise SystemExit(0)
     dist, app = build()
     selftest(app)
     zp = make_zip(dist)
