@@ -1085,51 +1085,58 @@ def gem_image():
 
 
 class Intro:
-    """Boot animation: the gem pops in, a ring of light spreads, sparkles twinkle and the
-    name slides up - then the intro fades out while the app window fades in (~1 s)."""
-    W, H = 420, 330
+    """Boot animation that continues the .exe's loading picture (splash.png): it starts as
+    exactly that picture, then the gem comes alive - a pulse, a ring of light, sparkles -
+    'loading...' turns into the version, and the app window fades in."""
+    GEM_C, GEM = (210, 114), 120          # gem centre and size in splash.png
 
     def __init__(self, root, on_done):
+        from PIL import ImageTk, ImageDraw, ImageFont
         self.root, self.on_done = root, on_done
+        base = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "splash.png")
+        splash = Image.open(base).convert("RGB")
         gem = gem_image()
+        self.W, self.H = splash.size
         self.win = w = tk.Toplevel(root)
         w.overrideredirect(True)
         w.attributes("-topmost", True)
-        w.configure(bg=BG)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        w.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+{(sh - self.H) // 2}")
-        self.cv = cv = tk.Canvas(w, width=self.W, height=self.H, bg=BG, highlightthickness=0)
+        w.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+{(sh - self.H) // 2}")   # where the splash was
+        self.cv = cv = tk.Canvas(w, width=self.W, height=self.H, highlightthickness=0, bd=0)
         cv.pack()
-        cv.create_rectangle(1, 1, self.W - 2, self.H - 2, outline=BORDER, width=2)
-        self.cx, self.cy = self.W // 2, 128
-        # the gem at every animation step, made once (scaling per frame would be slow)
+        self._bg = ImageTk.PhotoImage(splash)
+        cv.create_image(0, 0, anchor="nw", image=self._bg)
+        bg = "#%02x%02x%02x" % splash.getpixel((self.W // 2, self.H - 20))
+        self.bgcol = bg
+        cx, cy = self.GEM_C
+        self.ring = cv.create_oval(0, 0, 0, 0, outline=bg, width=4)
+        # the gem a little bigger at each pulse step (made once)
         self.frames = []
         if gem is not None:
-            from PIL import ImageTk
-            for i in range(16):
-                t = i / 15
-                scale = self._back(t)
-                size = max(8, int(150 * (0.55 + 0.45 * scale)))
-                im = gem.resize((size, size), Image.LANCZOS)
-                a = im.getchannel("A").point(lambda v, f=min(1.0, t * 2.2): int(v * f))
-                im.putalpha(a)
-                self.frames.append(ImageTk.PhotoImage(im))
-        self.ring = cv.create_oval(0, 0, 0, 0, outline=BG, width=5)
-        self.gem = cv.create_image(self.cx, self.cy, image=self.frames[0] if self.frames else None)
-        self.stars = [cv.create_polygon(0, 0, 0, 0, fill=BG, outline="") for _ in range(3)]
-        self.title = cv.create_text(self.cx, 248, text="Pet Art Filter", fill=BG, font=("Segoe UI", 22, "bold"))
-        self.sub = cv.create_text(self.cx, 282, text=f"Metin2  ·  Jintea  ·  v{updater.APP_VERSION}", fill=BG,
-                                  font=("Segoe UI", 11))
+            for i in range(12):
+                k = math.sin(math.pi * i / 11)                       # 0 -> 1 -> 0
+                size = int(self.GEM * (1 + 0.12 * k))
+                self.frames.append(ImageTk.PhotoImage(gem.resize((size, size), Image.LANCZOS)))
+        self.gem = cv.create_image(cx, cy, image=self.frames[0] if self.frames else None)
+        self.stars = [cv.create_polygon(0, 0, 0, 0, fill=bg, outline="") for _ in range(3)]
+        # "loading..." -> the version, in the splash's own font
+        try:
+            font = ImageFont.truetype("segoeui.ttf", 14)
+        except OSError:
+            font = ImageFont.load_default()
+        sub = Image.new("RGB", (self.W - 40, 24), splash.getpixel((30, 246)))
+        d = ImageDraw.Draw(sub)
+        text = f"Metin2 · Jintea  ·  v{updater.APP_VERSION}"
+        d.text(((sub.width - d.textlength(text, font=font)) / 2, 2), text, font=font, fill=(135, 144, 165))
+        self._sub = ImageTk.PhotoImage(sub)
+        self.sub_item = None
         self.t0 = time.perf_counter()
-        w.attributes("-alpha", 1.0)
+        w.update()
         self._tick()
 
-    @staticmethod
-    def _back(t):
-        """ease-out-back: overshoots a little, then settles (the 'pop')"""
-        c = 1.70158
-        t -= 1
-        return 1 + (c + 1) * t ** 3 + c * t ** 2
+    def _star(self, item, x, y, r):
+        self.cv.coords(item, x, y - r, x + r * 0.25, y - r * 0.25, x + r, y, x + r * 0.25, y + r * 0.25,
+                       x, y + r, x - r * 0.25, y + r * 0.25, x - r, y, x - r * 0.25, y - r * 0.25)
 
     @staticmethod
     def _mix(a, b, t):
@@ -1137,36 +1144,28 @@ class Intro:
         ca, cb = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
         return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
 
-    def _star(self, item, x, y, r):
-        self.cv.coords(item, x, y - r, x + r * 0.25, y - r * 0.25, x + r, y, x + r * 0.25, y + r * 0.25,
-                       x, y + r, x - r * 0.25, y + r * 0.25, x - r, y, x - r * 0.25, y - r * 0.25)
-
     def _tick(self):
         if not self.win.winfo_exists():
             return
         ms = (time.perf_counter() - self.t0) * 1000
-        cv, cx, cy = self.cv, self.cx, self.cy
-        if self.frames:                                        # gem pops in (0 - 450 ms)
-            cv.itemconfigure(self.gem, image=self.frames[min(15, int(ms / 450 * 15))])
-        t = (ms - 120) / 520                                   # ring of light spreads and fades
+        cv, (cx, cy) = self.cv, self.GEM_C
+        if self.frames:                                         # one soft pulse (0 - 420 ms)
+            cv.itemconfigure(self.gem, image=self.frames[min(11, int(ms / 420 * 11))])
+        t = (ms - 60) / 560                                     # ring of light around the gem
         if 0 <= t <= 1:
-            r = 62 + 58 * (1 - (1 - t) ** 3)          # stays inside the card
+            r = 64 + 22 * (1 - (1 - t) ** 3)
             cv.coords(self.ring, cx - r, cy - r, cx + r, cy + r)
-            cv.itemconfigure(self.ring, outline=self._mix(ACCENT, BG, t), width=max(1, int(6 * (1 - t))))
+            cv.itemconfigure(self.ring, outline=self._mix(ACCENT, self.bgcol, t), width=max(1, int(5 * (1 - t))))
         else:
-            cv.itemconfigure(self.ring, outline=BG)
-        for k, (dx, dy, delay) in enumerate(((84, -62, 200), (-92, 40, 330), (70, 58, 460))):
-            st = (ms - delay) / 380                            # sparkles twinkle
-            r = 11 * math.sin(math.pi * min(1.0, max(0.0, st)))
+            cv.coords(self.ring, 0, 0, 0, 0)
+        for k, (dx, dy, delay) in enumerate(((78, -50, 140), (-84, 34, 260), (66, 52, 380))):
+            st = (ms - delay) / 360                             # sparkles twinkle
+            r = 10 * math.sin(math.pi * min(1.0, max(0.0, st)))
             self._star(self.stars[k], cx + dx, cy + dy, max(0.1, r))
-            cv.itemconfigure(self.stars[k], fill=self._mix(BG, "#ffffff", 1.0 if 0 < st < 1 else 0.0))
-        tt = (ms - 300) / 380                                  # name slides up and fades in
-        e = 1 - (1 - min(1.0, max(0.0, tt))) ** 3
-        cv.coords(self.title, cx, 258 - 10 * e)
-        cv.coords(self.sub, cx, 292 - 10 * e)
-        cv.itemconfigure(self.title, fill=self._mix(BG, FG, e))
-        cv.itemconfigure(self.sub, fill=self._mix(BG, MUTED, e))
-        if ms < 850:
+            cv.itemconfigure(self.stars[k], fill="#ffffff" if 0 < st < 1 else self.bgcol)
+        if ms > 330 and self.sub_item is None:                  # loaded: show the version
+            self.sub_item = cv.create_image(20, 234, anchor="nw", image=self._sub)
+        if ms < 760:
             self.win.after(15, self._tick)
         else:
             self.on_done(self)
@@ -1510,7 +1509,7 @@ class App:
         tb.pack(side="left", padx=12)
         ctk.CTkLabel(tb, text="Pet Art Filter", font=self.f(17, "bold"), text_color=FG,
                      height=22, anchor="w").pack(anchor="w")
-        ctk.CTkLabel(tb, text=f"Metin2  ·  Jintea  ·  v{updater.APP_VERSION}", font=self.f(12),
+        ctk.CTkLabel(tb, text=f"Jintea  ·  v{updater.APP_VERSION}", font=self.f(12),
                      text_color=MUTED, height=16, anchor="w").pack(anchor="w")
 
         ctk.CTkLabel(side, text="MENU", font=self.f(11, "bold"), text_color=MUTED, anchor="w"
@@ -4014,10 +4013,10 @@ if __name__ == "__main__":
     root = ctk.CTk()
     root.withdraw()                    # shown by app.boot() (after the intro)
     app = App(root)
+    app.boot()                         # the intro takes over exactly where the loading picture is
     try:
-        import pyi_splash              # the loading picture of the .exe: done now
+        import pyi_splash              # ...so the loading picture can go now, without a gap
         pyi_splash.close()
     except Exception:
         pass
-    app.boot()
     root.mainloop()
