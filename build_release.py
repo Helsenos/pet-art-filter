@@ -152,15 +152,45 @@ def install(app):
     print("installed:", exe, "\nshortcut:", lnk)
 
 
+SIGNING_KEY = os.path.join(os.environ.get("APPDATA", HERE), "PetArtFilter", "release_signing.key")
+
+
+def sign(zip_path):
+    """Sign the zip with the owner's private key -> release.sig (players' apps check it).
+    The private key never leaves this PC; the app only contains the public half."""
+    import hashlib
+    import json
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization as S
+    with open(SIGNING_KEY, encoding="ascii") as fh:
+        key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(fh.read().strip()))
+    pub = key.public_key().public_bytes(S.Encoding.Raw, S.PublicFormat.Raw).hex()
+    if pub != updater.RELEASE_PUBKEY:
+        raise SystemExit("signing key doesn't match updater.RELEASE_PUBKEY - not signing")
+    h = hashlib.sha256()
+    with open(zip_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    sig = key.sign(updater.signed_message(VER, digest)).hex()
+    out = os.path.join(WORK, updater.SIG_NAME)
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump({"version": VER, "sha256": digest, "sig": sig}, fh)
+    print("signed:", out)
+    return out
+
+
 def publish(zip_path):
     if not updater.UPDATE_REPO:
         print("publish skipped: set UPDATE_REPO in updater.py first")
         return
+    sig_path = sign(zip_path)
     tag = f"v{VER}"
     notes = os.path.join(WORK, "notes.md")
     with open(notes, "w", encoding="utf-8") as fh:
         fh.write(NOTES)
-    run(["gh", "release", "create", tag, zip_path, "--repo", updater.UPDATE_REPO,
+    gh = shutil.which("gh") or r"C:\Program Files\GitHub CLI\gh.exe"
+    run([gh, "release", "create", tag, zip_path, sig_path, "--repo", updater.UPDATE_REPO,
          "--title", f"Pet Art Filter {VER}", "--notes-file", notes])
     print("published", tag)
 

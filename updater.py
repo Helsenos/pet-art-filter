@@ -10,6 +10,7 @@ folder and starts the new version.
 Only the app's own files are replaced (the .exe, README and the _internal folder);
 nothing else in the folder is touched, and settings live in %APPDATA%\\PetArtFilter.
 """
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,10 @@ import zipfile
 
 APP_VERSION = "1.1.1"
 UPDATE_REPO = "Helsenos/pet-art-filter"
+# Every release is signed with the owner's private key (kept only on the owner's PC);
+# an update is installed only if its signature matches this public key.
+RELEASE_PUBKEY = "ad8c40f4a28ef6770b4c3d5c4a72af1e9e5fd9b96cda1264afc81addbef909ae"
+SIG_NAME = "release.sig"
 EXE_NAME = "Pet Art Filter.exe"
 USER_AGENT = f"PetArtFilter/{APP_VERSION}"
 
@@ -48,11 +53,46 @@ def check_latest(timeout=6):
                                           "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         rel = json.load(r)
-    asset = next((a for a in rel.get("assets", []) if a.get("name", "").lower().endswith(".zip")), None)
+    assets = rel.get("assets", [])
+    asset = next((a for a in assets if a.get("name", "").lower().endswith(".zip")), None)
+    sig = next((a for a in assets if a.get("name", "") == SIG_NAME), None)
     if not asset:
         return None
     return {"version": rel.get("tag_name", "").lstrip("vV"), "notes": rel.get("body") or "",
-            "url": asset["browser_download_url"], "size": asset.get("size", 0)}
+            "url": asset["browser_download_url"], "size": asset.get("size", 0),
+            "sig_url": sig["browser_download_url"] if sig else None}
+
+
+def _official(url):
+    """Downloads only from this app's own GitHub releases."""
+    return isinstance(url, str) and url.startswith(f"https://github.com/{UPDATE_REPO}/releases/download/")
+
+
+def signed_message(version, sha256_hex):
+    return f"PetArtFilter release\n{version}\n{sha256_hex}".encode("utf-8")
+
+
+def _verify(info, zpath):
+    """The zip must be exactly the one the owner signed for this version."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+    if not info.get("sig_url") or not _official(info["sig_url"]):
+        raise RuntimeError("this update isn't signed - not installing it")
+    req = urllib.request.Request(info["sig_url"], headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        sig = json.loads(r.read(4096).decode("utf-8"))
+    h = hashlib.sha256()
+    with open(zpath, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    if sig.get("version") != info["version"] or sig.get("sha256") != digest:
+        raise RuntimeError("update signature doesn't match the download - not installing it")
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(RELEASE_PUBKEY)).verify(
+            bytes.fromhex(sig.get("sig", "")), signed_message(info["version"], digest))
+    except (InvalidSignature, ValueError):
+        raise RuntimeError("update signature is not valid - not installing it")
 
 
 def download_and_install(info, progress=None):
@@ -65,6 +105,8 @@ def download_and_install(info, progress=None):
     work = tempfile.mkdtemp(prefix="paf_update_")
     zpath = os.path.join(work, "update.zip")
 
+    if not _official(info.get("url")):
+        raise RuntimeError("update doesn't come from the official download page")
     req = urllib.request.Request(info["url"], headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as r, open(zpath, "wb") as fh:
         total = int(r.headers.get("Content-Length") or info.get("size") or 0)
@@ -79,6 +121,7 @@ def download_and_install(info, progress=None):
                 progress(done / total)
     if info.get("size") and os.path.getsize(zpath) != info["size"]:
         raise RuntimeError("download incomplete")
+    _verify(info, zpath)
 
     new_dir = os.path.join(work, "new")
     with zipfile.ZipFile(zpath) as z:
@@ -101,15 +144,18 @@ def download_and_install(info, progress=None):
     with open(script, "w", encoding="ascii") as fh:
         fh.write(r"""@echo off
 set FIND=%SystemRoot%\System32\find.exe
+set TASKLIST=%SystemRoot%\System32\tasklist.exe
+set ROBOCOPY=%SystemRoot%\System32\robocopy.exe
+set PING=%SystemRoot%\System32\PING.EXE
 rem wait for Pet Art Filter to close (at most ~60 s)
 set /a TRIES=0
 :wait
 set /a TRIES+=1
 if %TRIES% GTR 60 goto copy
-tasklist /FI "PID eq %PAF_PID%" /NH | "%FIND%" "%PAF_PID%" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
+"%TASKLIST%" /FI "PID eq %PAF_PID%" /NH | "%FIND%" "%PAF_PID%" >nul && ("%PING%" -n 2 127.0.0.1 >nul & goto wait)
 :copy
 rem replace only the app's own files
-robocopy "%PAF_SRC%\_internal" "%PAF_DST%\_internal" /MIR /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+"%ROBOCOPY%" "%PAF_SRC%\_internal" "%PAF_DST%\_internal" /MIR /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul
 if %errorlevel% GEQ 8 goto failed
 copy /Y "%PAF_SRC%\%PAF_EXE%" "%PAF_DST%\%PAF_EXE%" >nul || goto failed
 if exist "%PAF_SRC%\README.txt" copy /Y "%PAF_SRC%\README.txt" "%PAF_DST%\README.txt" >nul
@@ -126,10 +172,11 @@ exit /b 1
     # Hidden, but WITH an (invisible) console: in a fully detached process (no console)
     # the tasklist | find pipe never finishes and the update would hang forever.
     CREATE_NO_WINDOW, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000200, 0x01000000
+    cmd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
     try:
-        subprocess.Popen(["cmd", "/c", script], env=env, close_fds=True,
+        subprocess.Popen([cmd, "/c", script], env=env, close_fds=True,
                          creationflags=CREATE_NO_WINDOW | NEW_GROUP | BREAKAWAY)
     except OSError:     # not allowed to leave the job (rare): start it inside
-        subprocess.Popen(["cmd", "/c", script], env=env, close_fds=True,
+        subprocess.Popen([cmd, "/c", script], env=env, close_fds=True,
                          creationflags=CREATE_NO_WINDOW | NEW_GROUP)
     return True

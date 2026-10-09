@@ -1096,6 +1096,7 @@ class App:
         self.net_q = queue.Queue()
         self.seller_code = cloud.load_key(os.path.join(APP_DIR, "seller.key"), create=False)
         self.seller_name = ""        # name of the seller account the code belongs to
+        self._seller_checked = False  # asked the server about this code already
         self.sellers = []            # admin: all seller accounts
         self.admin_key = cloud.load_key(os.path.join(APP_DIR, "admin.key"), create=False)
         self.market_rows, self.market_mine, self.market_at = [], [], 0.0
@@ -1661,7 +1662,12 @@ class App:
                           height=28).pack(side="right")
 
     def _profile_matches(self, p, found):
-        present = dict(found)
+        present = {}
+        for n, v in found:          # values from the market come from other players: numbers only
+            try:
+                present[n] = float(v)
+            except (TypeError, ValueError):
+                pass
         want = p.get("bonuses") or {}
         if not want:
             return False
@@ -1888,6 +1894,7 @@ class App:
                 return
             self._store_seller_code(code)
             self.seller_name = info.get("name", "")
+            self._seller_checked = True
             self._set_status(f"Seller code saved – you sell as {self.seller_name}.", GOOD)
             win.destroy()
             self._render_seller_line()
@@ -1910,7 +1917,7 @@ class App:
             os.remove(os.path.join(APP_DIR, "seller.key"))
         except OSError:
             pass
-        self.seller_code, self.seller_name = None, ""
+        self.seller_code, self.seller_name, self._seller_checked = None, "", False
         self.market_mine = []
         self._render_seller_line()
         self._render_market()
@@ -1925,7 +1932,8 @@ class App:
                          text_color=GOOD).pack(side="left")
             self._btn(self.seller_line, "Remove code", self._forget_seller_code, kind="ghost", width=100,
                       height=26).pack(side="left", padx=8)
-            if not self.seller_name and cloud.configured():
+            if not self._seller_checked and cloud.configured():
+                self._seller_checked = True
                 code = self.seller_code
 
                 def job():
@@ -2017,6 +2025,25 @@ class App:
             text = ("Enter your seller code to see and sell your own pet arts."
                     if mine and not self.seller_code else "Nothing here yet.")
             ctk.CTkLabel(self.market_list, text=text, font=self.f(13), text_color=MUTED).pack(pady=30)
+
+    @staticmethod
+    def _valid_listing(r):
+        """Listings are other players' data: show only well-formed ones."""
+        try:
+            if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                return False
+            if not math.isfinite(float(r.get("price_kk"))):
+                return False
+            bon = r.get("bonuses")
+            if not isinstance(bon, list) or len(bon) > 7:
+                return False
+            for b in bon:
+                if not (isinstance(b, list) and len(b) == 2 and isinstance(b[0], str)
+                        and isinstance(b[1], (int, float)) and not isinstance(b[1], bool)):
+                    return False
+            return all(isinstance(r.get(k, ""), str) for k in ("item", "seller", "contact"))
+        except (TypeError, ValueError):
+            return False
 
     def _copy(self, text):
         self.root.clipboard_clear()
@@ -2249,51 +2276,59 @@ class App:
                 kind, data = self.net_q.get_nowait()
             except queue.Empty:
                 return
-            if kind == "msg":
-                self._set_status(*data)
-            elif kind == "progress":
-                self._set_status(data, ACCENT)
-                self.upd_lbl.configure(text=data, text_color=ACCENT)
-            elif kind == "update_failed":
-                self._set_status(data, BAD)
-                self._render_update_card()
-            elif kind == "update_none":
-                self.upd_lbl.configure(text=data, text_color=FG)
-            elif kind == "official":
-                self.official = data or []
-                if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
-                    self.current = None
-                    self._select_profile(self.profiles[0]["id"])
-                self._save()
-                self._render_presets()
-                self._recheck()
-            elif kind == "update":
-                self.update_info = data
-                self._render_update_card()
-                self._maybe_update_popup()
-            elif kind == "restart":
-                self._close()
-                return
-            elif kind == "seller":
-                self.seller_name = (data or {}).get("name", "") if data and data.get("active") else ""
-                if not data:
-                    self._set_status("Your seller code isn’t valid any more – ask the app owner.", WARN)
-                elif not data.get("active"):
-                    self._set_status("Your seller account is disabled.", WARN)
-                self._render_seller_line()
-            elif kind == "sellers":
-                self.sellers = data or []
-                self._render_sellers()
-            elif kind == "seller_code":
-                self._show_seller_code(*data)
-                self._admin_load_sellers()
-            elif kind in ("market", "mine"):
-                if kind == "market":
-                    self.market_rows = data or []
-                else:
-                    self.market_mine = data or []
-                self.market_at = time.time()
-                self._render_market()
+            try:
+                if self._net_one(kind, data) == "stop":
+                    return
+            except Exception as e:      # bad data from the internet must never stop the app's loop
+                self._set_status(f"Couldn’t show online data ({type(e).__name__}).", WARN)
+
+    def _net_one(self, kind, data):
+        if kind == "msg":
+            self._set_status(*data)
+        elif kind == "progress":
+            self._set_status(data, ACCENT)
+            self.upd_lbl.configure(text=data, text_color=ACCENT)
+        elif kind == "update_failed":
+            self._set_status(data, BAD)
+            self._render_update_card()
+        elif kind == "update_none":
+            self.upd_lbl.configure(text=data, text_color=FG)
+        elif kind == "official":
+            self.official = data or []
+            if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
+                self.current = None
+                self._select_profile(self.profiles[0]["id"])
+            self._save()
+            self._render_presets()
+            self._recheck()
+        elif kind == "update":
+            self.update_info = data
+            self._render_update_card()
+            self._maybe_update_popup()
+        elif kind == "restart":
+            self._close()
+            return "stop"
+        elif kind == "seller":
+            self.seller_name = (data or {}).get("name", "") if data and data.get("active") else ""
+            if not data:
+                self._set_status("Your seller code isn’t valid any more – ask the app owner.", WARN)
+            elif not data.get("active"):
+                self._set_status("Your seller account is disabled.", WARN)
+            self._render_seller_line()
+        elif kind == "sellers":
+            self.sellers = data or []
+            self._render_sellers()
+        elif kind == "seller_code":
+            self._show_seller_code(*data)
+            self._admin_load_sellers()
+        elif kind in ("market", "mine"):
+            rows = [r for r in (data or []) if self._valid_listing(r)]
+            if kind == "market":
+                self.market_rows = rows
+            else:
+                self.market_mine = rows
+            self.market_at = time.time()
+            self._render_market()
 
     # ------------------------------------------------------------ setup page
     def _build_setup(self, parent):

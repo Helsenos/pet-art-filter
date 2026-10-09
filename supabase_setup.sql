@@ -2,7 +2,7 @@
 -- Pet Art Filter - database setup for Supabase
 -- Paste this whole file into Supabase -> SQL Editor -> New query -> Run.
 -- Safe to run again (it only creates what's missing / replaces functions).
--- Then also run supabase_sellers.sql (invite-only selling).
+-- Then also run supabase_sellers.sql (invite-only selling) and supabase_hardening.sql.
 -- Note: Supabase's Security Advisor will list "market" as a "Security Definer View".
 -- That is intended (players read listings only through it). Do NOT change it.
 -- =====================================================================
