@@ -960,34 +960,14 @@ class Overlay:
                     on = self.pages.get(gi, 0) == i
                     cv.create_rectangle(x0 - ox, y0 - oy, x1 - ox, y1 - oy,
                                         outline=safe_color(GOOD if on else "#e0b040"), width=3 if on else 1)
+        style = getattr(self, "style", DEFAULT_STYLE)
         for (gi, pg, r, c), status in marks.items():
             if gi >= len(grids) or pg != self.pages.get(gi, 0):
                 continue
             x0, y0, x1, y1 = slot_rect(grids[gi], r, c)
-            x0, y0, x1, y1 = x0 - ox, y0 - oy, x1 - ox, y1 - oy
-            if status == "good":
-                # one ring per matched preset colour; "rainbow" = animated rainbow
-                cols = self.colors.get((gi, pg, r, c)) or ["rainbow"]
-                h = self.phase + (r * 0.07 + c * 0.05)
-                for k, pad in enumerate((5, 2, -1)):
-                    a0, b0, a1, b1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
-                    w = 4 if k < 2 else 2
-                    col = cols[k % len(cols)]
-                    if col == "rainbow":
-                        for side, (sx0, sy0, sx1, sy1) in enumerate(
-                                ((a0, b0, a1, b0), (a1, b0, a1, b1), (a1, b1, a0, b1), (a0, b1, a0, b0))):
-                            cv.create_line(sx0, sy0, sx1, sy1, width=w, capstyle="projecting",
-                                           fill=self._hue(h + side * 0.25 + k * 0.12))
-                    else:
-                        glow = col if (self.pulse or len(cols) > 1) else _mix(col, 0.45)
-                        cv.create_rectangle(a0, b0, a1, b1, outline=safe_color(glow), width=w)
-            elif status == "incomplete":
-                cv.create_line(x0 + 5, y0 + 5, x1 - 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
-                cv.create_line(x1 - 5, y0 + 5, x0 + 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
-            elif status == "missed":
-                cv.create_oval(x1 - 10, y0 + 3, x1 - 3, y0 + 10, fill=safe_color(WARN), outline="")
-            elif show_scanned and status == "bad":
-                cv.create_line(x0 + 4, y1 - 4, x1 - 4, y1 - 4, fill=safe_color(BAD), width=2)
+            draw_mark(cv, status, (x0 - ox, y0 - oy, x1 - ox, y1 - oy), style,
+                      self.colors.get((gi, pg, r, c)), self.phase, self.pulse, self._hue,
+                      seed=r * 0.07 + c * 0.05)
         if self.flash_slot and self.flash_slot[0] < len(grids):
             gi, pg, r, c = self.flash_slot
             g = grids[gi]
@@ -1002,6 +982,75 @@ class Overlay:
         if self.cover:       # a window lies over the game: cut the glows out exactly there
             l, t, r_, b = self.cover
             cv.create_rectangle(l - ox, t - oy, r_ - ox, b - oy, fill=KEY_COLOR, outline=KEY_COLOR, width=0)
+
+
+MARK_STYLES = {
+    "good": ["Glow", "Outline", "Corners", "Dot"],
+    "bad": ["Line", "Cross", "Dim", "Off"],
+    "incomplete": ["Red X", "Red dot", "Off"],
+    "missed": ["Dot", "Off"],
+}
+DEFAULT_STYLE = {k: v[0] for k, v in MARK_STYLES.items()}
+
+
+def draw_mark(cv, status, box, style, cols, phase, pulse, hue, seed=0.0):
+    """Draw one slot mark on a canvas. box = (x0, y0, x1, y1) in canvas pixels;
+    cols = preset colours ("rainbow" animates); hue(h) -> colour."""
+    x0, y0, x1, y1 = box
+    st = style.get(status)
+
+    def colour(col, k=0):
+        if col == "rainbow":
+            return hue(phase + seed + k * 0.12)
+        return safe_color(col if (pulse or len(cols) > 1) else _mix(col, 0.45))
+
+    if status == "good":
+        cols = cols or ["rainbow"]
+        if st == "Glow":         # animated rings, one per matched preset colour
+            h = phase + seed
+            for k, pad in enumerate((5, 2, -1)):
+                a0, b0, a1, b1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
+                w = 4 if k < 2 else 2
+                col = cols[k % len(cols)]
+                if col == "rainbow":
+                    for side, (sx0, sy0, sx1, sy1) in enumerate(
+                            ((a0, b0, a1, b0), (a1, b0, a1, b1), (a1, b1, a0, b1), (a0, b1, a0, b0))):
+                        cv.create_line(sx0, sy0, sx1, sy1, width=w, capstyle="projecting",
+                                       fill=hue(h + side * 0.25 + k * 0.12))
+                else:
+                    cv.create_rectangle(a0, b0, a1, b1, outline=colour(col), width=w)
+        elif st == "Outline":    # one clean frame per colour
+            for k, col in enumerate(cols[:3]):
+                pad = 1 - 3 * k
+                cv.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, outline=colour(col, k), width=2)
+        elif st == "Corners":    # four corner brackets
+            n = max(6, int((x1 - x0) * 0.3))
+            col = colour(cols[0])
+            for (cx_, cy_, dx, dy) in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+                cv.create_line(cx_, cy_ + dy * n, cx_, cy_, cx_ + dx * n, cy_, width=3, fill=col)
+        elif st == "Dot":        # a dot in the top-right corner
+            for k, col in enumerate(cols[:3]):
+                r = 5
+                cxd, cyd = x1 - 7 - k * 11, y0 + 7
+                cv.create_oval(cxd - r, cyd - r, cxd + r, cyd + r, fill=colour(col, k), outline="")
+    elif status == "bad":
+        if st == "Line":
+            cv.create_line(x0 + 4, y1 - 4, x1 - 4, y1 - 4, fill=safe_color(BAD), width=2)
+        elif st == "Cross":
+            cv.create_line(x1 - 11, y0 + 4, x1 - 4, y0 + 11, fill=safe_color(BAD), width=2)
+            cv.create_line(x1 - 4, y0 + 4, x1 - 11, y0 + 11, fill=safe_color(BAD), width=2)
+        elif st == "Dim":
+            cv.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1, fill=safe_color("#000000"), outline="",
+                                stipple="gray50")
+    elif status == "incomplete":
+        if st == "Red X":
+            cv.create_line(x0 + 5, y0 + 5, x1 - 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
+            cv.create_line(x1 - 5, y0 + 5, x0 + 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
+        elif st == "Red dot":
+            cv.create_oval(x0 + 3, y0 + 3, x0 + 12, y0 + 12, fill=safe_color("#ff2a2a"), outline="")
+    elif status == "missed":
+        if st == "Dot":
+            cv.create_oval(x1 - 10, y0 + 3, x1 - 3, y0 + 10, fill=safe_color(WARN), outline="")
 
 
 # ================================================================ in-game mini bar
@@ -1212,6 +1261,7 @@ class App:
         self.ocr_scale = tk.DoubleVar(value=2.5)
         self.show_grid = tk.BooleanVar(value=False)
         self.show_scanned = tk.BooleanVar(value=True)
+        self.mark_style = {k: tk.StringVar(value=v) for k, v in DEFAULT_STYLE.items()}   # glow style
         self.only_good = tk.BooleanVar(value=False)
         self.on_top = tk.BooleanVar(value=False)
         self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
@@ -1230,6 +1280,7 @@ class App:
         self.overlay = Overlay(root)
         self.minibar = MiniBar(self)
         self.game_layer = GameLayer(self._game_exe)
+        self._apply_style()
         self._cover = None
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
@@ -2740,9 +2791,6 @@ class App:
         sw.pack(fill="x", padx=18, pady=(0, 16))
         ctk.CTkSwitch(sw, text="Show grid lines", variable=self.show_grid, progress_color=ACCENT,
                       font=self.f(13), text_color=FG, command=self._refresh_overlay).pack(side="left")
-        ctk.CTkSwitch(sw, text="Red line under scanned bad slots", variable=self.show_scanned,
-                      progress_color=ACCENT, font=self.f(13), text_color=FG,
-                      command=self._refresh_overlay).pack(side="left", padx=24)
 
         note = self._card(pg)
         note.pack(fill="x", padx=28, pady=(0, 28))
@@ -2808,6 +2856,27 @@ class App:
                       progress_color=ACCENT, font=self.f(13), text_color=FG,
                       command=self._save).pack(anchor="w", padx=18, pady=(0, 16))
         self._mark_accent()
+
+        gc = self._card(pg, "Glow style", "How the app marks slots in the game.")
+        gc.pack(fill="x", padx=28, pady=(0, 16))
+        body = ctk.CTkFrame(gc, fg_color="transparent")
+        body.pack(fill="x", padx=18, pady=(4, 16))
+        opts = ctk.CTkFrame(body, fg_color="transparent")
+        opts.pack(side="left", anchor="n")
+        for i, (key, label) in enumerate((("good", "Good pet arts"), ("bad", "Not good"),
+                                          ("incomplete", "Not read fully"), ("missed", "Skipped (hover again)"))):
+            ctk.CTkLabel(opts, text=label, font=self.f(12), text_color=MUTED, anchor="w", width=150
+                         ).grid(row=i, column=0, sticky="w", pady=4)
+            ctk.CTkSegmentedButton(opts, values=MARK_STYLES[key], variable=self.mark_style[key], font=self.f(12),
+                                   selected_color=ACCENT, selected_hover_color=ACCENT_H, fg_color=CARD2,
+                                   unselected_color=CARD2, unselected_hover_color=BORDER, text_color=FG,
+                                   command=lambda _v: self._style_changed()).grid(row=i, column=1, sticky="w", pady=4)
+        # live preview: a few fake slots drawn exactly like in the game
+        self._style_cv = tk.Canvas(body, width=4 * 46 + 14, height=70, bg="#151109", highlightthickness=0)
+        self._style_cv.pack(side="right", anchor="n", padx=(16, 0))
+        self._style_cv._keep_colors = True
+        self._style_phase = 0.0
+        self._style_preview()
 
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
                         "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
@@ -2965,6 +3034,32 @@ class App:
         cb = self._btn(row, "Copy code", copy, kind="accent", width=150)
         cb.pack(side="left")
         self._btn(row, "Done", win.destroy, width=100).pack(side="right")
+
+    def _style_changed(self):
+        self._apply_style()
+        self._save()
+
+    def _apply_style(self):
+        style = {k: v.get() if v.get() in MARK_STYLES[k] else DEFAULT_STYLE[k] for k, v in self.mark_style.items()}
+        self.overlay.style = style
+        self.overlay.redraw()
+
+    def _style_preview(self):
+        """Animated preview of the glow styles (only while Settings is open)."""
+        cv = self._style_cv
+        if self._page == "settings" and cv.winfo_exists():
+            cv.delete("all")
+            self._style_phase = (self._style_phase + 0.04) % 1.0
+            pulse = int(self._style_phase * 25) % 2 == 0
+            style = {k: v.get() for k, v in self.mark_style.items()}
+            for i, status in enumerate(("good", "bad", "incomplete", "missed")):
+                x0, y0 = 10 + i * 46, 12
+                cv.create_rectangle(x0, y0, x0 + 34, y0 + 34, fill="#2b241a", outline="#4a3d2a")
+                draw_mark(cv, status, (x0, y0, x0 + 34, y0 + 34), style, ["rainbow"], self._style_phase,
+                          pulse, self.overlay._hue)
+            for i, t in enumerate(("good", "not good", "not read", "skipped")):
+                cv.create_text(10 + i * 46 + 17, 62, text=t, fill="#a39478", font=("Segoe UI", 7))
+        self.root.after(60, self._style_preview)
 
     def _strip_drag(self, e, final=False):
         x = min(max(e.x - self._strip_pad, 0), self._strip_w - 1)
@@ -3125,7 +3220,8 @@ class App:
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
                 "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
-                "minibar": self.minibar_on, "animations": self.anim_on}
+                "minibar": self.minibar_on, "animations": self.anim_on,
+                **{f"style_{k}": v for k, v in self.mark_style.items()}}
 
     def _save(self):
         cfg = {}
