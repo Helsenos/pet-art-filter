@@ -8,3 +8,6 @@ admin.key
 *.tmp
 *.key
 *.bak
+update_log.txt
+live_state.json
+selftest.txt

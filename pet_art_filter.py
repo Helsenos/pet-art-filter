@@ -2613,8 +2613,14 @@ class App:
         try:
             info = updater.check_latest()
         except Exception as e:
+            detail = updater.error_detail(e)
+            try:                                      # kept for finding out what blocks updates
+                with open(os.path.join(APP_DIR, "update_log.txt"), "a", encoding="utf-8") as fh:
+                    fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  v{updater.APP_VERSION}  {detail}\n")
+            except OSError:
+                pass
             if manual:
-                self.net_q.put(("update_none", updater.describe_error(e)))
+                self.net_q.put(("update_error", (updater.describe_error(e), detail)))
             return          # automatic check: just try again later
         if info and updater.is_newer(info["version"]):
             self.net_q.put(("update", info))
@@ -2744,8 +2750,16 @@ class App:
         elif kind == "update_failed":
             self._set_status(data, BAD)
             self._render_update_card()
+            self.upd_lbl.configure(text=f"{data}\nYou can download it from the download page instead.",
+                                   text_color=WARN)
+            self.upd_page_btn.pack(side="left")
         elif kind == "update_none":
             self.upd_lbl.configure(text=data, text_color=FG)
+            self.upd_page_btn.pack_forget()
+        elif kind == "update_error":
+            msg, detail = data
+            self.upd_lbl.configure(text=f"{msg}\nDetails: {detail}", text_color=WARN)
+            self.upd_page_btn.pack(side="left")     # the browser usually still gets through
         elif kind == "official":
             self.official = data or []
             if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
@@ -2840,13 +2854,17 @@ class App:
                         "Nothing is installed unless you click “Update now”. Your filters, presets, grids "
                         "and font memory are kept.")
         uc.pack(fill="x", padx=28, pady=(0, 16))
-        self.upd_lbl = ctk.CTkLabel(uc, text="", font=self.f(13), text_color=FG, anchor="w")
+        self.upd_lbl = ctk.CTkLabel(uc, text="", font=self.f(13), text_color=FG, anchor="w", justify="left",
+                                    wraplength=760)
         self.upd_lbl.pack(fill="x", padx=18, pady=(4, 8))
         ur = ctk.CTkFrame(uc, fg_color="transparent")
         ur.pack(fill="x", padx=18, pady=(0, 16))
         self._btn(ur, "Check for updates", self._manual_update_check, width=170).pack(side="left")
         self.upd_btn = self._btn(ur, "Update now", self._install_update, kind="accent", width=150)
         self.upd_btn.pack(side="left", padx=10)
+        # shown when the app can't reach the update server: download it in the browser instead
+        self.upd_page_btn = self._btn(ur, "Open download page", lambda: webbrowser.open(updater.DOWNLOAD_PAGE),
+                                      width=170)
         self._render_update_card()
 
         ac = self._card(pg, "Appearance", "Pick the app’s colours – they change right away.")

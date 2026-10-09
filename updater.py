@@ -45,6 +45,64 @@ def can_self_update():
     return bool(getattr(sys, "frozen", False)) and bool(UPDATE_REPO)
 
 
+def _windows_download(url, path):
+    """Download with Windows' own internet stack (the one Edge and Windows Update use):
+    it follows the system's proxy settings and is often let through by antivirus web
+    filters that stop other programs. Raises OSError on failure."""
+    import ctypes
+    try:
+        ctypes.windll.wininet.DeleteUrlCacheEntryW(url)        # never an old cached copy
+    except Exception:
+        pass
+    hr = ctypes.windll.urlmon.URLDownloadToFileW(None, url, path, 0, None)
+    if hr != 0 or not os.path.exists(path):
+        raise OSError(f"Windows download failed (0x{hr & 0xFFFFFFFF:08X})")
+
+
+def _windows_get(url, limit=4 << 20):
+    fd, path = tempfile.mkstemp(prefix="paf_dl_")
+    os.close(fd)
+    try:
+        _windows_download(url, path)
+        with open(path, "rb") as fh:
+            return fh.read(limit)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _parse_release(rel):
+    assets = rel.get("assets", [])
+    asset = next((a for a in assets if a.get("name", "").lower().endswith(".zip")), None)
+    sig = next((a for a in assets if a.get("name", "") == SIG_NAME), None)
+    if not asset:
+        return None
+    return {"version": rel.get("tag_name", "").lstrip("vV"), "notes": rel.get("body") or "",
+            "url": asset["browser_download_url"], "size": asset.get("size", 0),
+            "sig_url": sig["browser_download_url"] if sig else None}
+
+
+def _from_version(ver):
+    base = f"https://github.com/{UPDATE_REPO}/releases/download/v{ver}/"
+    return {"version": ver, "notes": "", "url": base + f"Pet.Art.Filter.v{ver}.zip", "size": 0,
+            "sig_url": base + SIG_NAME}
+
+
+def _latest_via_windows():
+    """Same two routes as below, through Windows' downloader."""
+    try:
+        data = _windows_get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest?t={os.getpid()}")
+        return _parse_release(json.loads(data.decode("utf-8")))
+    except Exception:
+        html = _windows_get(f"https://github.com/{UPDATE_REPO}/releases/latest").decode("utf-8", "ignore")
+        m = re.search(r"/releases/tag/v?(\d+(?:\.\d+){1,3})[\"'/?#]", html)
+        if not m:
+            raise OSError("release page didn't name a version")
+        return _from_version(m.group(1))
+
+
 def check_latest(timeout=6):
     """-> dict(version, notes, url, size, sig_url) for the latest release, or None.
     Asks GitHub's API first (it has the release notes). The API allows only 60 requests
@@ -58,8 +116,13 @@ def check_latest(timeout=6):
     except Exception as api_error:
         try:
             return _latest_from_page(timeout)
-        except Exception:
-            raise api_error
+        except Exception as page_error:
+            try:
+                return _latest_via_windows()       # e.g. proxy / filter only Windows' stack passes
+            except Exception as win_error:
+                api_error.page_error = page_error  # everything failed: keep all reasons
+                api_error.win_error = win_error
+                raise api_error
 
 
 def _latest_from_api(timeout):
@@ -68,14 +131,7 @@ def _latest_from_api(timeout):
                                           "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         rel = json.load(r)
-    assets = rel.get("assets", [])
-    asset = next((a for a in assets if a.get("name", "").lower().endswith(".zip")), None)
-    sig = next((a for a in assets if a.get("name", "") == SIG_NAME), None)
-    if not asset:
-        return None
-    return {"version": rel.get("tag_name", "").lstrip("vV"), "notes": rel.get("body") or "",
-            "url": asset["browser_download_url"], "size": asset.get("size", 0),
-            "sig_url": sig["browser_download_url"] if sig else None}
+    return _parse_release(rel)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -96,10 +152,21 @@ def _latest_from_page(timeout):
     m = re.search(r"/releases/tag/v?(\d+(?:\.\d+){1,3})$", loc)
     if not m:
         return None
-    ver = m.group(1)
-    base = f"https://github.com/{UPDATE_REPO}/releases/download/v{ver}/"
-    return {"version": ver, "notes": "", "url": base + f"Pet.Art.Filter.v{ver}.zip", "size": 0,
-            "sig_url": base + SIG_NAME}
+    return _from_version(m.group(1))
+
+
+DOWNLOAD_PAGE = f"https://github.com/{UPDATE_REPO}/releases/latest"
+
+
+def error_detail(e):
+    """Technical reason (for finding out what blocks the update), both routes."""
+    def one(x):
+        return f"{type(x).__name__}: {getattr(x, 'reason', None) or x}"[:180]
+    out = one(e)
+    for extra in ("page_error", "win_error"):
+        if getattr(e, extra, None) is not None:
+            out += " | " + one(getattr(e, extra))
+    return out
 
 
 def describe_error(e):
@@ -133,9 +200,13 @@ def _verify(info, zpath):
     from cryptography.exceptions import InvalidSignature
     if not info.get("sig_url") or not _official(info["sig_url"]):
         raise RuntimeError("this update isn't signed - not installing it")
-    req = urllib.request.Request(info["sig_url"], headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        sig = json.loads(r.read(4096).decode("utf-8"))
+    try:
+        req = urllib.request.Request(info["sig_url"], headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read(4096)
+    except Exception:
+        raw = _windows_get(info["sig_url"], 4096)
+    sig = json.loads(raw.decode("utf-8"))
     h = hashlib.sha256()
     with open(zpath, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -162,18 +233,25 @@ def download_and_install(info, progress=None):
 
     if not _official(info.get("url")):
         raise RuntimeError("update doesn't come from the official download page")
-    req = urllib.request.Request(info["url"], headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30) as r, open(zpath, "wb") as fh:
-        total = int(r.headers.get("Content-Length") or info.get("size") or 0)
-        done = 0
-        while True:
-            chunk = r.read(256 * 1024)
-            if not chunk:
-                break
-            fh.write(chunk)
-            done += len(chunk)
-            if progress and total:
-                progress(done / total)
+    try:
+        req = urllib.request.Request(info["url"], headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as r, open(zpath, "wb") as fh:
+            total = int(r.headers.get("Content-Length") or info.get("size") or 0)
+            done = 0
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done / total)
+    except Exception:
+        if progress:
+            progress(0.0)
+        _windows_download(info["url"], zpath)      # no progress here, but it gets through
+        if progress:
+            progress(1.0)
     if info.get("size") and os.path.getsize(zpath) != info["size"]:
         raise RuntimeError("download incomplete")
     _verify(info, zpath)
