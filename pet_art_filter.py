@@ -40,6 +40,7 @@ import numpy as np
 import cloud
 import font_reader
 import grid_finder
+import subprocess
 import updater
 
 MSS = getattr(mss, "MSS", None) or mss.mss
@@ -147,12 +148,40 @@ OCR_SCALES = (2.5, 3.0)  # each tooltip is read at these zooms and the results m
 # reaches at most 459 px below the slot and 169 px to the side of its centre.
 TOOLTIP_DELAY_MS = 50
 CAPTURE = {"width": 440, "above": 460, "below": 480}
+UPDATE_EVERY_MS = 30 * 60 * 1000   # look for a new version every 30 minutes while the app is open
 ARTS_PER_PET = 7  # every pet art has 7 bonuses; fewer read = OCR missed some
 
 BG, PANEL, FG, MUTED = "#0c0f16", "#151a25", "#e9edf5", "#8790a5"
 GOOD, BAD, WARN, ACCENT = "#34d399", "#f87171", "#fbbf24", "#7c5cff"
 ACCENT_H, CYAN = "#6847f5", "#22d3ee"
 SIDEBAR, CARD, CARD2, BORDER = "#10141d", "#151a25", "#1d2331", "#262e40"
+SELECT, DANGER_H = "#2a2350", "#3a2028"
+
+# app colour themes (Settings -> Appearance); applied at start, so a change needs a quick restart
+THEMES = {
+    "Dark":     dict(BG="#0c0f16", PANEL="#151a25", FG="#e9edf5", MUTED="#8790a5", SIDEBAR="#10141d",
+                     CARD="#151a25", CARD2="#1d2331", BORDER="#262e40", SELECT="#2a2350", DANGER_H="#3a2028"),
+    "Midnight": dict(BG="#000000", PANEL="#0d0d12", FG="#f2f2f7", MUTED="#8a8a99", SIDEBAR="#060609",
+                     CARD="#0d0d12", CARD2="#17171f", BORDER="#24242f", SELECT="#262040", DANGER_H="#331a20"),
+    "Metin":    dict(BG="#14110c", PANEL="#1d1912", FG="#eee3c8", MUTED="#a39478", SIDEBAR="#0f0d09",
+                     CARD="#1d1912", CARD2="#2a2419", BORDER="#3d3423", SELECT="#3a3020", DANGER_H="#3a2018"),
+    "Light":    dict(BG="#f3f5f9", PANEL="#ffffff", FG="#151a25", MUTED="#5d6680", SIDEBAR="#e7eaf1",
+                     CARD="#ffffff", CARD2="#eef1f6", BORDER="#d5dbe6", SELECT="#ddd6ff", DANGER_H="#fbe1e1"),
+}
+CURRENT_THEME, CURRENT_ACCENT = "Dark", "Violet"
+ACCENTS = {"Violet": ("#7c5cff", "#6847f5"), "Blue": ("#3b82f6", "#2563eb"), "Emerald": ("#10b981", "#059669"),
+           "Rose": ("#f43f5e", "#e11d48"), "Amber": ("#f59e0b", "#d97706"), "Cyan": ("#06b6d4", "#0891b2")}
+
+
+def apply_theme(theme, accent):
+    """Set the colour globals before the window is built."""
+    g = globals()
+    theme = theme if theme in THEMES else "Dark"
+    accent = accent if accent in ACCENTS else "Violet"
+    g["CURRENT_THEME"], g["CURRENT_ACCENT"] = theme, accent
+    g.update(THEMES[theme])
+    g["ACCENT"], g["ACCENT_H"] = ACCENTS.get(accent, ACCENTS["Violet"])
+    ctk.set_appearance_mode("light" if theme == "Light" else "dark")
 MUST_COL = "#f5b041"
 KEY_COLOR = "#010203"  # overlay transparency key
 
@@ -1015,6 +1044,8 @@ class App:
         self.contact = ""
 
         self._style()
+        self.theme, self.accent = CURRENT_THEME, CURRENT_ACCENT    # set by apply_theme() at start
+        self._theme_at_start = (self.theme, self.accent)
         self._build()
         self._load()
         self.overlay = Overlay(root)
@@ -1035,7 +1066,9 @@ class App:
         # build the colour table now, so the first hovered pet art doesn't wait for it
         threading.Thread(target=font_reader._lut, daemon=True).start()
         self._bg(self._fetch_official)
+        self._popup_shown = set()
         self._bg(self._check_update)
+        root.after(UPDATE_EVERY_MS, self._periodic_update_check)
         root.protocol("WM_DELETE_WINDOW", self._close)
         root.after(30, self._poll)
 
@@ -1051,7 +1084,7 @@ class App:
         s.configure("Modern.Treeview.Heading", background=CARD, foreground=MUTED, relief="flat",
                     borderwidth=0, font=("Segoe UI", 9, "bold"), padding=(8, 8))
         s.map("Modern.Treeview.Heading", background=[("active", CARD2)])
-        s.map("Modern.Treeview", background=[("selected", "#2a2350")], foreground=[("selected", FG)])
+        s.map("Modern.Treeview", background=[("selected", SELECT)], foreground=[("selected", FG)])
         s.layout("Modern.Treeview", [("Modern.Treeview.treearea", {"sticky": "nswe"})])
 
     def _card(self, parent, title=None, subtitle=None):
@@ -1067,7 +1100,7 @@ class App:
 
     def _btn(self, parent, text, cmd, kind="soft", **kw):
         colors = {"accent": (ACCENT, ACCENT_H, "white"), "soft": (CARD2, BORDER, FG),
-                  "danger": (CARD2, "#3a2028", BAD), "ghost": ("transparent", CARD2, ACCENT)}[kind]
+                  "danger": (CARD2, DANGER_H, BAD), "ghost": ("transparent", CARD2, ACCENT)}[kind]
         kw.setdefault("height", 34)
         kw.setdefault("corner_radius", 10)
         return ctk.CTkButton(parent, text=text, command=cmd, fg_color=colors[0], hover_color=colors[1],
@@ -1102,12 +1135,16 @@ class App:
                      height=22, anchor="w").pack(anchor="w")
         ctk.CTkLabel(tb, text=f"Metin2  ·  Jintea  ·  v{updater.APP_VERSION}", font=self.f(12),
                      text_color=MUTED, height=16, anchor="w").pack(anchor="w")
+        self.cog = ctk.CTkButton(side, text="⚙", width=30, height=30, corner_radius=9, fg_color="transparent",
+                                 hover_color=CARD2, text_color=MUTED, font=self.f(17),
+                                 command=lambda: self._show_page("settings"))
+        self.cog.place(relx=1.0, x=-8, y=8, anchor="ne")   # small cogwheel in the sidebar's top-right corner
 
         ctk.CTkLabel(side, text="MENU", font=self.f(11, "bold"), text_color=MUTED, anchor="w"
                      ).pack(fill="x", padx=26, pady=(0, 6))
         self.nav = {}
         for key, icon, label in (("scan", "◎", "Scanner"), ("filter", "☰", "Filter"),
-                                 ("market", "◈", "Market"), ("setup", "⚙", "Setup")):
+                                 ("market", "◈", "Market"), ("setup", "▦", "Setup")):
             b = ctk.CTkButton(side, text=f"{icon}    {label}", anchor="w", height=44, corner_radius=12,
                               fg_color="transparent", hover_color=CARD2, text_color=MUTED,
                               font=self.f(14, "bold"), command=lambda k=key: self._show_page(k))
@@ -1116,15 +1153,6 @@ class App:
 
         bottom = ctk.CTkFrame(side, fg_color="transparent")
         bottom.pack(side="bottom", fill="x", padx=14, pady=18)
-        # update banner (hidden until a newer version is found)
-        self.update_box = ctk.CTkFrame(bottom, fg_color="#1f1a3a", corner_radius=12, border_width=1,
-                                       border_color=ACCENT)
-        self.update_lbl = ctk.CTkLabel(self.update_box, text="", font=self.f(12, "bold"), text_color=FG,
-                                       wraplength=180, justify="left")
-        self.update_lbl.pack(fill="x", padx=12, pady=(10, 4))
-        self.update_btn = self._btn(self.update_box, "Install update", self._install_update, kind="accent",
-                                    height=30)
-        self.update_btn.pack(fill="x", padx=12, pady=(0, 10))
         self.scan_btn = ctk.CTkButton(bottom, text="▶   Start scanning", height=50, corner_radius=14,
                                       fg_color=ACCENT, hover_color=ACCENT_H, font=self.f(15, "bold"),
                                       command=self._toggle)
@@ -1150,7 +1178,8 @@ class App:
         main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=1)
         self.pages_ui = {"scan": self._build_scan(main), "filter": self._build_filter(main),
-                         "market": self._build_market(main), "setup": self._build_setup(main)}
+                         "market": self._build_market(main), "setup": self._build_setup(main),
+                         "settings": self._build_settings(main)}
         self._show_page("scan")
 
     def _show_page(self, key):
@@ -1162,6 +1191,8 @@ class App:
         for k, b in self.nav.items():
             on = k == key
             b.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED)
+        self.cog.configure(fg_color=CARD2 if key == "settings" else "transparent",
+                           text_color=FG if key == "settings" else MUTED)
         if key == "market" and time.time() - self.market_at > 60:
             self._market_refresh()
 
@@ -1258,7 +1289,8 @@ class App:
         self.hist_slots = {}
         return pg
 
-    def _set_status(self, text, color=MUTED):
+    def _set_status(self, text, color=None):
+        color = color or MUTED
         self.status.configure(text=text, text_color=color)
 
     def _set_verdict(self, text, color, sub=""):
@@ -1594,7 +1626,7 @@ class App:
             top.pack(fill="x", padx=16, pady=(12, 0))
             ctk.CTkLabel(top, text=name, font=self.f(14, "bold"), text_color=FG).pack(side="left")
             ctk.CTkButton(top, text="✕", width=28, height=28, corner_radius=8, fg_color="transparent",
-                          hover_color="#3a2028", text_color=MUTED, font=self.f(13),
+                          hover_color=DANGER_H, text_color=MUTED, font=self.f(13),
                           command=lambda n=name: self._set_mode(n, "Ignore")).pack(side="right")
             seg = ctk.CTkSegmentedButton(top, values=["Want", "Must"], height=26, font=self.f(11, "bold"),
                                          selected_color=col, selected_hover_color=col,
@@ -1890,22 +1922,86 @@ class App:
         if cloud.configured():
             self.net_q.put(("official", cloud.official_presets()))
 
-    def _check_update(self):
+    def _periodic_update_check(self):
+        if getattr(self, "_closing", False):
+            return
+        self._bg(self._check_update)
+        self.root.after(UPDATE_EVERY_MS, self._periodic_update_check)
+
+    def _check_update(self, manual=False):
+        """Looks for a newer version. Never installs anything by itself - the player decides."""
+        if not updater.UPDATE_REPO:
+            if manual:
+                self.net_q.put(("update_none", "Updates aren’t connected yet."))
+            return
         try:
             info = updater.check_latest()
         except Exception:
-            return          # offline or GitHub busy: just try again next start
+            if manual:
+                self.net_q.put(("update_none", "Couldn’t reach the update server – check your internet."))
+            return          # automatic check: just try again later
         if info and updater.is_newer(info["version"]):
             self.net_q.put(("update", info))
+        elif manual:
+            self.net_q.put(("update_none", f"You have the newest version (v{updater.APP_VERSION})."))
+
+    def _manual_update_check(self):
+        self.upd_lbl.configure(text="Checking…", text_color=MUTED)
+        self._bg(lambda: self._check_update(manual=True))
+
+    def _render_update_card(self):
+        info = getattr(self, "update_info", None)
+        if info:
+            self.upd_lbl.configure(text=f"⬆  Version {info['version']} is available (you have "
+                                   f"v{updater.APP_VERSION})", text_color=ACCENT)
+            self.upd_btn.configure(state="normal", text="Update now")
+        else:
+            self.upd_lbl.configure(text=f"You have v{updater.APP_VERSION}.", text_color=FG)
+            self.upd_btn.configure(state="disabled", text="Update now")
+
+    def _maybe_update_popup(self):
+        info = getattr(self, "update_info", None)
+        if not info or info["version"] in self._popup_shown or getattr(self, "_closing", False):
+            return
+        if self.scanner:        # never interrupt a scan: ask once scanning is stopped
+            self.root.after(3000, self._maybe_update_popup)
+            return
+        self._popup_shown.add(info["version"])
+        win = ctk.CTkToplevel(self.root)
+        win.title("Update available")
+        win.configure(fg_color=BG)
+        win.geometry("440x360")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.after(50, win.lift)
+        icon = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "app.ico")
+        if os.path.exists(icon):
+            win.after(250, lambda: win.iconbitmap(icon))    # CTkToplevel sets its own icon first
+        ctk.CTkLabel(win, text="New version available", font=self.f(20, "bold"), text_color=FG
+                     ).pack(anchor="w", padx=22, pady=(20, 2))
+        ctk.CTkLabel(win, text=f"Version {info['version']}  ·  you have v{updater.APP_VERSION}",
+                     font=self.f(13), text_color=MUTED).pack(anchor="w", padx=22)
+        notes = ctk.CTkTextbox(win, height=170, corner_radius=12, fg_color=CARD, text_color=FG, font=self.f(12),
+                               border_width=1, border_color=BORDER, wrap="word")
+        notes.insert("1.0", (info.get("notes") or "Improvements and fixes.").strip()[:3000])
+        notes.configure(state="disabled")
+        notes.pack(fill="both", expand=True, padx=22, pady=12)
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=22, pady=(0, 18))
+        self._btn(row, "Later", win.destroy, width=120).pack(side="right")
+        self._btn(row, "Update now", lambda: (win.destroy(), self._install_update()), kind="accent",
+                  width=150).pack(side="right", padx=(0, 10))
 
     def _install_update(self):
         info = getattr(self, "update_info", None)
         if not info:
             return
+        if self.scanner:
+            self._stop()
         if not updater.can_self_update():
             webbrowser.open(f"https://github.com/{updater.UPDATE_REPO}/releases/latest")
             return
-        self.update_btn.configure(state="disabled", text="Downloading…")
+        self.upd_btn.configure(state="disabled", text="Downloading…")
 
         def job():
             try:
@@ -1961,9 +2057,12 @@ class App:
                 self._set_status(*data)
             elif kind == "progress":
                 self._set_status(data, ACCENT)
+                self.upd_lbl.configure(text=data, text_color=ACCENT)
             elif kind == "update_failed":
                 self._set_status(data, BAD)
-                self.update_btn.configure(state="normal", text="Install update")
+                self._render_update_card()
+            elif kind == "update_none":
+                self.upd_lbl.configure(text=data, text_color=FG)
             elif kind == "official":
                 self.official = data or []
                 if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
@@ -1974,8 +2073,8 @@ class App:
                 self._recheck()
             elif kind == "update":
                 self.update_info = data
-                self.update_lbl.configure(text=f"⬆  Version {data['version']} is available")
-                self.update_box.pack(fill="x", pady=(0, 12), before=self.scan_btn)
+                self._render_update_card()
+                self._maybe_update_popup()
             elif kind == "restart":
                 self._close()
                 return
@@ -2002,7 +2101,7 @@ class App:
         lb = ctk.CTkFrame(g, fg_color=CARD2, corner_radius=12)
         lb.pack(fill="x", padx=18, pady=(6, 10))
         self.grid_list = tk.Listbox(lb, height=4, bg=CARD2, fg=FG, relief="flat", bd=0,
-                                    selectbackground="#2a2350", selectforeground=FG, highlightthickness=0,
+                                    selectbackground=SELECT, selectforeground=FG, highlightthickness=0,
                                     font=("Segoe UI", 11), activestyle="none")
         self.grid_list.pack(fill="x", padx=12, pady=10)
         row = ctk.CTkFrame(g, fg_color="transparent")
@@ -2027,6 +2126,55 @@ class App:
         ctk.CTkSwitch(sw, text="Red line under scanned bad slots", variable=self.show_scanned,
                       progress_color=ACCENT, font=self.f(13), text_color=FG,
                       command=self._refresh_overlay).pack(side="left", padx=24)
+
+        note = self._card(pg)
+        note.pack(fill="x", padx=28, pady=(0, 28))
+        ctk.CTkLabel(note, text="ⓘ  Run the game in windowed or borderless-windowed mode so the glow can be "
+                     "drawn on top of it.", font=self.f(12), text_color=MUTED, anchor="w"
+                     ).pack(fill="x", padx=18, pady=14)
+        return pg
+
+    # ------------------------------------------------------------ settings page
+    def _build_settings(self, parent):
+        pg = ctk.CTkScrollableFrame(parent, fg_color=BG, corner_radius=0,
+                                    scrollbar_button_color=CARD2, scrollbar_button_hover_color=BORDER)
+        self._page_title(pg, "Settings", "Updates, colours and app options.")
+
+        uc = self._card(pg, "Updates", "When a new version comes out, a window pops up and asks you. "
+                        "Nothing is installed unless you click “Update now”. Your filters, presets, grids "
+                        "and font memory are kept.")
+        uc.pack(fill="x", padx=28, pady=(0, 16))
+        self.upd_lbl = ctk.CTkLabel(uc, text="", font=self.f(13), text_color=FG, anchor="w")
+        self.upd_lbl.pack(fill="x", padx=18, pady=(4, 8))
+        ur = ctk.CTkFrame(uc, fg_color="transparent")
+        ur.pack(fill="x", padx=18, pady=(0, 16))
+        self._btn(ur, "Check for updates", self._manual_update_check, width=170).pack(side="left")
+        self.upd_btn = self._btn(ur, "Update now", self._install_update, kind="accent", width=150)
+        self.upd_btn.pack(side="left", padx=10)
+        self._render_update_card()
+
+        ac = self._card(pg, "Appearance", "Pick the app’s colours. The app restarts for a second to apply them.")
+        ac.pack(fill="x", padx=28, pady=(0, 16))
+        self.theme_var = ctk.StringVar(value=self.theme)
+        ctk.CTkLabel(ac, text="Theme", font=self.f(12), text_color=MUTED, anchor="w").pack(fill="x", padx=18)
+        ctk.CTkSegmentedButton(ac, values=list(THEMES), variable=self.theme_var, font=self.f(13),
+                               selected_color=ACCENT, selected_hover_color=ACCENT_H, fg_color=CARD2,
+                               unselected_color=CARD2, unselected_hover_color=BORDER, text_color=FG,
+                               command=lambda _v: self._theme_changed()).pack(anchor="w", padx=18, pady=(2, 12))
+        ctk.CTkLabel(ac, text="Accent colour", font=self.f(12), text_color=MUTED, anchor="w").pack(fill="x", padx=18)
+        sw = ctk.CTkFrame(ac, fg_color="transparent")
+        sw.pack(anchor="w", padx=18, pady=(4, 18))
+        self.accent_btns = {}
+        for name, (col, hov) in ACCENTS.items():
+            b = ctk.CTkButton(sw, text="", width=34, height=34, corner_radius=17, fg_color=col, hover_color=hov,
+                              border_width=3 if name == self.accent else 0, border_color=FG,
+                              command=lambda n=name: self._accent_changed(n))
+            b.pack(side="left", padx=(0, 8))
+            self.accent_btns[name] = b
+        self.theme_row = ctk.CTkFrame(ac, fg_color="transparent")      # shown once colours were changed
+        self.theme_lbl = ctk.CTkLabel(self.theme_row, text="", font=self.f(12), text_color=WARN, anchor="w")
+        self.theme_lbl.pack(side="left")
+        self.theme_btn = self._btn(self.theme_row, "Restart now", self._restart, kind="accent", width=130)
 
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
                         "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
@@ -2058,12 +2206,37 @@ class App:
                             "★ preset in everyone’s app within a few minutes. Keep admin.key private.")
             ad.pack(fill="x", padx=28, pady=(0, 16))
 
-        note = self._card(pg)
-        note.pack(fill="x", padx=28, pady=(0, 28))
-        ctk.CTkLabel(note, text="ⓘ  Run the game in windowed or borderless-windowed mode so the glow can be "
-                     "drawn on top of it.", font=self.f(12), text_color=MUTED, anchor="w"
-                     ).pack(fill="x", padx=18, pady=14)
         return pg
+
+    def _theme_changed(self):
+        self.theme = self.theme_var.get()
+        self._save()
+        self._theme_pending()
+
+    def _accent_changed(self, name):
+        self.accent = name
+        for n, b in self.accent_btns.items():
+            b.configure(border_width=3 if n == name else 0)
+        self._save()
+        self._theme_pending()
+
+    def _theme_pending(self):
+        if (self.theme, self.accent) == self._theme_at_start:
+            self.theme_row.pack_forget()
+        else:
+            self.theme_lbl.configure(text="New colours are saved – restart to see them.")
+            self.theme_btn.pack(side="right")
+            self.theme_row.pack(fill="x", padx=18, pady=(0, 16))
+
+    def _restart(self):
+        """Start a fresh copy of the app, then close this one."""
+        args = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        try:
+            subprocess.Popen(args, close_fds=True)
+        except Exception as e:
+            self._set_status(f"Couldn’t restart: {e}", BAD)
+            return
+        self._close()
 
     # ------------------------------------------------------------ config
     def _load(self):
@@ -2129,6 +2302,7 @@ class App:
         cfg["official_on"] = self.official_on
         cfg["official_cache"] = self.official
         cfg["seller"], cfg["contact"] = self.seller, self.contact
+        cfg["theme"], cfg["accent"] = self.theme, self.accent
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
@@ -2598,7 +2772,12 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _selftest()
         sys.exit(0)
-    ctk.set_appearance_mode("dark")
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            _cfg = json.load(fh)
+    except Exception:
+        _cfg = {}
+    apply_theme(_cfg.get("theme", "Dark"), _cfg.get("accent", "Violet"))
     root = ctk.CTk()
     App(root)
     root.mainloop()
