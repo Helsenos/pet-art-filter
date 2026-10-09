@@ -101,9 +101,13 @@ def download_and_install(info, progress=None):
     with open(script, "w", encoding="ascii") as fh:
         fh.write(r"""@echo off
 set FIND=%SystemRoot%\System32\find.exe
-rem wait for Pet Art Filter to close
+rem wait for Pet Art Filter to close (at most ~60 s)
+set /a TRIES=0
 :wait
-tasklist /FI "PID eq %PAF_PID%" | "%FIND%" "%PAF_PID%" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
+set /a TRIES+=1
+if %TRIES% GTR 60 goto copy
+tasklist /FI "PID eq %PAF_PID%" /NH | "%FIND%" "%PAF_PID%" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
+:copy
 rem replace only the app's own files
 robocopy "%PAF_SRC%\_internal" "%PAF_DST%\_internal" /MIR /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul
 if %errorlevel% GEQ 8 goto failed
@@ -119,6 +123,13 @@ exit /b 1
 """)
     env = dict(os.environ, PAF_PID=str(os.getpid()), PAF_SRC=src, PAF_DST=install_dir, PAF_EXE=EXE_NAME,
                PAF_WORK=work)
-    subprocess.Popen(["cmd", "/c", script], env=env, creationflags=0x08000000 | 0x00000008,  # no window, detached
-                     close_fds=True)
+    # Hidden, but WITH an (invisible) console: in a fully detached process (no console)
+    # the tasklist | find pipe never finishes and the update would hang forever.
+    CREATE_NO_WINDOW, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000200, 0x01000000
+    try:
+        subprocess.Popen(["cmd", "/c", script], env=env, close_fds=True,
+                         creationflags=CREATE_NO_WINDOW | NEW_GROUP | BREAKAWAY)
+    except OSError:     # not allowed to leave the job (rare): start it inside
+        subprocess.Popen(["cmd", "/c", script], env=env, close_fds=True,
+                         creationflags=CREATE_NO_WINDOW | NEW_GROUP)
     return True
