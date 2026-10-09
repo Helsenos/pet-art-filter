@@ -36,6 +36,9 @@ RATIO = 0.75       # ...and it must beat the best match with a different label b
 FAINT = 0.4        # text-layer values below this are icon specks, ignored when comparing
 GLYPH_TOL = 0.2    # same for a single character
 USE_DP = True      # read unseen values character by character
+SPECK_TOL = 0.27   # names: a speck next to the text may push the worst-window score up to this...
+SPECK_MEAN = 0.08  # ...if the average difference over the whole word stays this small
+SPECK_RATIO = 0.62 # ...and the best name is clearly better than any other (d1 <= 0.62 * d2)
 MAX_PICS = 6
 VALUE_TOKEN = re.compile(r"^\+?\d{1,3}(,\d{3})*%?$")
 
@@ -249,6 +252,17 @@ def _batch_diff1(q, stack, sq, ss):
     return best
 
 
+def _mean_diff(a, b):
+    """Average difference (not worst spot) of two pictures, best of small shifts."""
+    best = 9.0
+    for sa, sb in ((0, 0), (1, 0), (0, 1), (2, 0), (0, 2)):
+        x, y = a[:, sa:], b[:, sb:]
+        m = min(x.shape[1], y.shape[1])
+        d = (np.abs(x[:, :m] - y[:, :m]).sum() + x[:, m:].sum() + y[:, m:].sum()) / (x.shape[0] * max(x.shape[1], y.shape[1]))
+        best = min(best, float(d))
+    return best
+
+
 def _diff(a, b):
     if abs(a.shape[1] - b.shape[1]) > 2:
         return 1.0
@@ -265,26 +279,33 @@ class _Index:
             groups.setdefault(pic.shape[1], []).append((label, pic))
         self.by_w = {w: ([l for l, _ in g], np.stack([p for _, p in g])) for w, g in groups.items()}
 
-    def best(self, q, tol):
-        per = {}
+    def best(self, q, tol, speck=False):
+        per, pic = {}, {}
         wq = q.shape[1]
         for w in range(wq - 2, wq + 3):
             g = self.by_w.get(w)
             if g is None:
                 continue
             labels, stack = g
-            for l, d in zip(labels, _batch_diff(q, stack)):
+            for i, (l, d) in enumerate(zip(labels, _batch_diff(q, stack))):
                 if d < per.get(l, 9):
                     per[l] = d
+                    pic[l] = stack[i]
         if not per:
             return None
         ranked = sorted(per.items(), key=lambda kv: kv[1])
         l1, d1 = ranked[0]
-        if d1 > tol:
-            return None
-        if len(ranked) > 1 and d1 > RATIO * ranked[1][1]:
-            return None   # two labels look alike here: not sure
-        return l1
+        d2 = ranked[1][1] if len(ranked) > 1 else 9.0
+        if d1 <= tol and d1 <= RATIO * d2:
+            return l1
+        # a speck of the icon behind the tooltip can spoil the worst spot of an otherwise
+        # perfect name: accept only if the whole word matches closely AND it's a clear winner
+        if speck and d1 <= SPECK_TOL and d1 <= SPECK_RATIO * d2:
+            m1 = _mean_diff(q, pic[l1])
+            m2 = _mean_diff(q, pic[ranked[1][0]]) if len(ranked) > 1 else 9.0
+            if m1 <= SPECK_MEAN and m1 <= 0.6 * m2:
+                return l1
+        return None
 
 
 def _clean(pic):
@@ -387,11 +408,21 @@ class FontReader:
             return None
         out = ""
         for a, b in segs:
-            if b - a > 13:
-                return None   # two characters touching
-            ch = gidx.best(pic[:, a:b], GLYPH_TOL)
+            ch = gidx.best(pic[:, a:b], GLYPH_TOL) if b - a <= 13 else None
             if ch is None:
-                return None
+                # a faint speck (icon behind the tooltip) can glue two characters together:
+                # cut this piece again on solid strokes only, keeping 1 px of soft edge
+                piece = pic[:, a:b]
+                parts = _segments((piece > 0.7).any(0), 1)
+                if len(parts) < 1 or (len(parts) == 1 and parts[0] == (0, b - a)):
+                    return None
+                ch = ""
+                for sa, sb in parts:
+                    sa, sb = max(0, sa - 1), min(b - a, sb + 1)
+                    c = gidx.best(piece[:, sa:sb], GLYPH_TOL)
+                    if c is None:
+                        return None
+                    ch += c
             out += ch
         return out if VALUE_TOKEN.match(out) else None
 
@@ -431,7 +462,7 @@ class FontReader:
                 npic, vpic = img[:, words[1][0]:], img[:, words[0][0]:words[0][1]]
             else:
                 npic, vpic = img[:, :words[-2][1]], img[:, words[-1][0]:words[-1][1]]
-            bonus = nidx.best(npic, NAME_TOL)
+            bonus = nidx.best(npic, NAME_TOL, speck=True)
             if not bonus:
                 continue
             vtxt = self._read_value(vpic)
