@@ -96,19 +96,29 @@ def download_and_install(info, progress=None):
         raise RuntimeError("the downloaded update doesn't look like this app")
 
     script = os.path.join(work, "apply_update.cmd")
-    pid = os.getpid()
-    with open(script, "w", encoding="ascii", errors="ignore") as fh:
-        fh.write(f"""@echo off
+    # Paths go in as environment variables: the .cmd file itself stays pure ASCII, so
+    # folders with accents (C:\Users\Jürgen) or other special characters still work.
+    with open(script, "w", encoding="ascii") as fh:
+        fh.write(r"""@echo off
+set FIND=%SystemRoot%\System32\find.exe
 rem wait for Pet Art Filter to close
 :wait
-tasklist /FI "PID eq {pid}" | find "{pid}" >nul && (timeout /t 1 /nobreak >nul & goto wait)
+tasklist /FI "PID eq %PAF_PID%" | "%FIND%" "%PAF_PID%" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
 rem replace only the app's own files
-robocopy "{src}\\_internal" "{install_dir}\\_internal" /MIR /R:5 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-copy /Y "{src}\\{EXE_NAME}" "{install_dir}\\{EXE_NAME}" >nul
-if exist "{src}\\README.txt" copy /Y "{src}\\README.txt" "{install_dir}\\README.txt" >nul
-start "" "{install_dir}\\{EXE_NAME}"
-rmdir /s /q "{work}" 2>nul
+robocopy "%PAF_SRC%\_internal" "%PAF_DST%\_internal" /MIR /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+if %errorlevel% GEQ 8 goto failed
+copy /Y "%PAF_SRC%\%PAF_EXE%" "%PAF_DST%\%PAF_EXE%" >nul || goto failed
+if exist "%PAF_SRC%\README.txt" copy /Y "%PAF_SRC%\README.txt" "%PAF_DST%\README.txt" >nul
+start "" "%PAF_DST%\%PAF_EXE%"
+rmdir /s /q "%PAF_WORK%" 2>nul
+exit /b 0
+:failed
+echo Update could not be installed (files in use?). Starting the current version.> "%PAF_DST%\update_failed.txt"
+start "" "%PAF_DST%\%PAF_EXE%"
+exit /b 1
 """)
-    subprocess.Popen(["cmd", "/c", script], creationflags=0x08000000 | 0x00000008,  # no window, detached
+    env = dict(os.environ, PAF_PID=str(os.getpid()), PAF_SRC=src, PAF_DST=install_dir, PAF_EXE=EXE_NAME,
+               PAF_WORK=work)
+    subprocess.Popen(["cmd", "/c", script], env=env, creationflags=0x08000000 | 0x00000008,  # no window, detached
                      close_fds=True)
     return True

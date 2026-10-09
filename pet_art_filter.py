@@ -21,6 +21,7 @@ import os
 import queue
 import shutil
 import sys
+import math
 import re
 import secrets
 import unicodedata
@@ -157,6 +158,9 @@ def _mix(col, t):
     """Blend a #rrggbb colour towards white by t (0..1)."""
     r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
     return "#%02x%02x%02x" % tuple(int(v + (255 - v) * t) for v in (r, g, b))
+
+
+_re_hex = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def _swatch(col):
@@ -497,9 +501,9 @@ class OcrWorker(threading.Thread):
                 t = time.perf_counter()
                 name, arts, debug, box = self.reader.read(np.asarray(img), cx, want_box=True)
                 ms = (time.perf_counter() - t) * 1000
+                self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
                 if arts and box:
                     save_dataset(img, cx, box, name, arts)
-                self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
                 if 0 < len(arts) < ARTS_PER_PET:
                     save_training(img, cx, debug)
                 try:
@@ -597,9 +601,9 @@ class Improver(threading.Thread):
                 with open(base + ".json", encoding="utf-8") as fh:
                     meta = json.load(fh)
                 rgb = np.asarray(Image.open(base + ".png").convert("RGB"))
+                arts = self.app.reader.read(rgb, meta["cx"])[1]
             except Exception:
-                meta, rgb = None, None
-            arts = self.app.reader.read(rgb, meta["cx"])[1] if meta else []
+                meta, arts = None, []          # unreadable / broken case: drop it
             if meta is None or len(arts) >= ARTS_PER_PET or meta.get("tries", 0) >= 4:
                 solved += bool(meta) and len(arts) >= ARTS_PER_PET
                 for ext in (".json", ".png"):
@@ -1218,7 +1222,10 @@ class App:
         out = [dict(p, official=False) for p in self.profiles]
         for o in self.official:
             d = o.get("data") or {}
-            out.append({"id": "o:" + o["id"], "name": o.get("name", "Official"), "color": o.get("color", "rainbow"),
+            col = o.get("color", "rainbow")
+            if col != "rainbow" and not _re_hex.match(str(col)):
+                col = "rainbow"
+            out.append({"id": "o:" + o["id"], "name": o.get("name", "Official"), "color": col,
                         "on": self.official_on.get(o["id"], True), "min": d.get("min", 1),
                         "bonuses": d.get("bonuses", {}), "official": True})
         return out
@@ -1261,8 +1268,9 @@ class App:
         p = self._find_profile(self.current)
         if p is None or not p["official"]:
             return
-        copy = {"id": self._new_id(), "name": p["name"] + " (mine)", "color": p["color"], "on": True,
-                "min": p.get("min", 1), "bonuses": json.loads(json.dumps(p.get("bonuses", {})))}
+        copy = {"id": self._new_id(), "name": (p["name"] + " (mine)")[:40], "color": p["color"], "on": True,
+                "min": p.get("min", 1), "bonuses": json.loads(json.dumps(p.get("bonuses", {}))),
+                "from": p["id"][2:]}
         self.profiles.append(copy)
         self.official_on[p["id"][2:]] = False
         self.current = copy["id"]
@@ -1294,14 +1302,15 @@ class App:
         self._select_profile(p["id"])
 
     def _dup_profile(self):
+        self._editor_to_profile()
         p = self._find_profile(self.current)
         if not p:
             return
-        self._editor_to_profile()
         copy = {"id": self._new_id(), "name": p["name"] + " copy", "color": p["color"], "on": True,
                 "min": p.get("min", 1), "bonuses": json.loads(json.dumps(p.get("bonuses", {})))}
         self.profiles.append(copy)
         self._select_profile(copy["id"])
+        self._recheck()
 
     def _rename_profile(self):
         self._ensure_editable()
@@ -1640,13 +1649,13 @@ class App:
             self._set_status("Select a pet art in the Results list first.", WARN)
             return
         arts = list((self.slot_arts.get(slot) or {}).items())
-        if len(arts) < ARTS_PER_PET:
+        if len(arts) != ARTS_PER_PET:
             self._set_status("That pet art wasn’t read completely – hover it again first.", WARN)
             return
         if not cloud.configured():
             self._set_status("The market isn’t online yet.", WARN)
             return
-        item = self.slot_names.get(slot) or "Pet art"
+        item = (self.slot_names.get(slot) or "Pet art")[:40]
         win = ctk.CTkToplevel(self.root)
         win.title("Sell on market")
         win.configure(fg_color=BG)
@@ -1671,15 +1680,21 @@ class App:
             entries[key] = e
 
         def submit():
+            raw = entries["price"].get().lower().replace("kk", "").replace(" ", "").strip()
+            if raw.count(",") == 1 and "." not in raw:
+                raw = raw.replace(",", ".")            # 2,5 -> 2.5
             try:
-                price = float(entries["price"].get().replace(",", ".").lower().replace("kk", "").strip())
-                assert price > 0
-            except Exception:
-                messagebox.showwarning("Price", "Enter the price in KK, e.g. 150 or 2.5", parent=win)
+                price = float(raw)
+                ok = math.isfinite(price) and 0 < price <= 10_000_000 and raw.count(".") <= 1
+            except ValueError:
+                ok = False
+            if not ok:
+                messagebox.showwarning("Price", "Enter the price in KK as a number, e.g. 150 or 2.5", parent=win)
                 return
             seller = entries["seller"].get().strip()
-            if len(seller) < 2:
-                messagebox.showwarning("Name", "Enter your character name so buyers can whisper you.", parent=win)
+            if not 2 <= len(seller) <= 24:
+                messagebox.showwarning("Name", "Enter your character name (2-24 letters) so buyers can whisper "
+                                               "you.", parent=win)
                 return
             self.seller, self.contact = seller, entries["contact"].get().strip()[:80]
             self._save()
@@ -1711,7 +1726,10 @@ class App:
             self.net_q.put(("official", cloud.official_presets()))
 
     def _check_update(self):
-        info = updater.check_latest()
+        try:
+            info = updater.check_latest()
+        except Exception:
+            return          # offline or GitHub busy: just try again next start
         if info and updater.is_newer(info["version"]):
             self.net_q.put(("update", info))
 
@@ -1725,8 +1743,12 @@ class App:
         self.update_btn.configure(state="disabled", text="Downloading…")
 
         def job():
-            updater.download_and_install(info, lambda f: self.net_q.put(
-                ("progress", f"Downloading update… {int(f * 100)}%")))
+            try:
+                updater.download_and_install(info, lambda f: self.net_q.put(
+                    ("progress", f"Downloading update… {int(f * 100)}%")))
+            except Exception as e:
+                self.net_q.put(("update_failed", f"Update failed: {e}"))
+                return
             self.net_q.put(("restart", None))
         self._bg(job)
 
@@ -1739,11 +1761,14 @@ class App:
             return
         self._editor_to_profile()
         key, data = self.admin_key, {"min": p.get("min", 1), "bonuses": p.get("bonuses", {})}
+        src = p.get("from") if any(o.get("id") == p.get("from") for o in self.official) else None
+        name = p["name"][:-7] if src and p["name"].endswith(" (mine)") else p["name"]
+        name = name[:40]
 
         def job():
-            cloud.publish_preset(key, p["name"], p["color"], data)
+            cloud.publish_preset(key, name, p["color"], data, preset_id=src)   # update it if it came from one
             self.net_q.put(("official", cloud.official_presets()))
-            self.net_q.put(("msg", (f"Published “{p['name']}” to all players.", GOOD)))
+            self.net_q.put(("msg", (f"Published “{name}” to all players.", GOOD)))
         self._bg(job)
 
     def _admin_unpublish(self):
@@ -1771,11 +1796,14 @@ class App:
                 self._set_status(*data)
             elif kind == "progress":
                 self._set_status(data, ACCENT)
+            elif kind == "update_failed":
+                self._set_status(data, BAD)
+                self.update_btn.configure(state="normal", text="Install update")
             elif kind == "official":
                 self.official = data or []
                 if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
-                    self.current = self.profiles[0]["id"]
-                    self._profile_to_editor(self.profiles[0])
+                    self.current = None
+                    self._select_profile(self.profiles[0]["id"])
                 self._save()
                 self._render_presets()
                 self._recheck()
@@ -1785,6 +1813,7 @@ class App:
                 self.update_box.pack(fill="x", pady=(0, 12), before=self.scan_btn)
             elif kind == "restart":
                 self._close()
+                return
             elif kind in ("market", "mine"):
                 if kind == "market":
                     self.market_rows = data or []
@@ -2174,6 +2203,7 @@ class App:
             self._update_stats()
 
     def _close(self):
+        self._closing = True
         self._save()
         self._stop()
         self.root.destroy()
@@ -2212,6 +2242,8 @@ class App:
         return f"{g['name']}{page}  r{r + 1} c{c + 1}"
 
     def _poll(self):
+        if getattr(self, "_closing", False):
+            return
         # hotkeys
         for vk, fn in ((VK_F6, self._toggle), (VK_F7, self._clear_marks)):
             down = key_down(vk)
@@ -2247,6 +2279,7 @@ class App:
             self._refresh_overlay()
         self._handle_net()
         if time.time() - self._last_official > 600:   # official presets: check every 10 minutes
+            self._last_official = time.time()
             self._bg(self._fetch_official)
         self._tick = getattr(self, "_tick", 0) + 1
         if self._tick % 10 == 0:   # ~3x a second is plenty for the status texts

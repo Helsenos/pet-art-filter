@@ -336,6 +336,7 @@ class FontReader:
         self._idx = (None, None)
         self._cache = {}     # exact line picture -> fast-path answer (cleared when something is learned)
         self._cache_ver = 0
+        self._save_lock = threading.Lock()
         self._load()
 
     # ---- persistence
@@ -352,10 +353,11 @@ class FontReader:
     def save(self):
         with self.lock:
             data = pickle.dumps({"names": self.names, "tokens": self.tokens, "glyphs": self.glyphs})
-        tmp = self.path + ".tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, self.path)
+        with self._save_lock:          # several reader threads may learn at the same moment
+            tmp = f"{self.path}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, self.path)
 
     def purge_text_bonuses(self):
         """Drop 'other text' pictures whose text is really a bonus line (old learning bug)."""
@@ -438,15 +440,16 @@ class FontReader:
         (very common: base stats, frequent bonus lines) are answered from a cache."""
         if self._cache_ver != self._ver:
             self._cache, self._cache_ver = {}, self._ver
+        cache = self._cache        # this thread's snapshot: a cleared cache isn't refilled with old answers
         key = hashlib.blake2b(ln["img"].tobytes() + repr(ln["words"]).encode() +
                               repr(ln["img"].shape).encode(), digest_size=16).digest()
-        hit = self._cache.get(key)
+        hit = cache.get(key)
         if hit is not None:
             return hit
         res = self._classify_uncached(ln)
-        if len(self._cache) > 20000:
-            self._cache.clear()
-        self._cache[key] = res
+        if len(cache) > 20000:
+            cache.clear()
+        cache[key] = res
         return res
 
     def _classify_uncached(self, ln):
