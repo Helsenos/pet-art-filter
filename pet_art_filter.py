@@ -846,7 +846,7 @@ class GameLayer:
             h = user32.GetWindow(h, self.GW_HWNDNEXT)
         self.game = fallback
 
-    def covered(self, areas, ours):
+    def covered(self, areas, layers):
         """True when the glows shouldn't show: the game is minimized, or another program
         is the active window and lies over the inventory / stash. (The game runs as
         administrator, so Windows only lets always-on-top windows show over it - the
@@ -857,8 +857,14 @@ class GameLayer:
         if user32.IsIconic(g):
             return True
         fg = user32.GetForegroundWindow()
-        if not fg or fg == g or fg in ours or self._exe_of(fg) in (None, self.exe):
-            return False             # the game, Pet Art Filter itself, or something we can't tell
+        if not fg or fg == g or fg in layers:
+            return False             # the game itself, or our own glow layer / mini bar
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+        if pid.value != os.getpid() and self._exe_of(fg) in (None, self.exe):
+            return False             # another window of the game, or something we can't tell
+        # any other program - Pet Art Filter's own window and dialogs included - covers the
+        # glows when it lies over the inventory / stash
         r = wt.RECT()
         if not user32.GetWindowRect(fg, ctypes.byref(r)) or user32.IsIconic(fg):
             return False
@@ -1465,13 +1471,16 @@ class App:
                 self.game_layer.track((g["x"] + g["w"] / 2, g["y"] + g["h"] / 2) if g else None)
             if self._tick % 3:                 # ~10x a second is plenty
                 return
-            ours = {self.overlay.hwnd, self.minibar.hwnd, user32.GetParent(self.root.winfo_id())}
+            layers = {self.overlay.hwnd, self.minibar.hwnd}
+            fade = getattr(self, "_fade", None)
+            if fade is not None:
+                layers.add(user32.GetParent(fade.winfo_id()))
             areas = [(g["x"], g["y"], g["x"] + g["w"], g["y"] + g["h"]) for g in self.grids]
             if self.minibar_on.get():
                 mb = self.minibar.win
                 areas.append((mb.winfo_rootx(), mb.winfo_rooty(),
                               mb.winfo_rootx() + mb.winfo_width(), mb.winfo_rooty() + mb.winfo_height()))
-            covered = self.game_layer.covered(areas, ours)
+            covered = self.game_layer.covered(areas, layers)
             if covered != self._covered:
                 self._covered = covered
                 self.overlay.covered = covered
