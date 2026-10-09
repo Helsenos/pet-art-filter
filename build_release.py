@@ -26,10 +26,9 @@ WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyI
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
 NOTES = """\
-* Filter presets: run several filters at once, each glows in its own colour on the slot
-* Official presets from the app owner appear automatically (marked with a star)
-* Market: list your scanned pet arts for KK and browse what others sell
-* Automatic updates: the app offers new versions with one click
+- Updates are now digitally signed: the app only installs updates that really come from the app owner
+- Safer market: broken or fake listings can't freeze the app anymore
+- Fixed: the app no longer keeps asking the server about a disabled seller code
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
