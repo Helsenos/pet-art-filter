@@ -822,8 +822,7 @@ class MiniBar:
         self.win.attributes("-topmost", True)
         self.win.attributes("-transparentcolor", self.KEY)
         # styled like the game's own UI: dark stone, thin bronze frame, small square icon buttons
-        bar = ctk.CTkFrame(self.win, corner_radius=4, fg_color=self.STONE, bg_color=self.KEY, border_width=2,
-                           border_color=self.BRONZE)
+        bar = ctk.CTkFrame(self.win, corner_radius=4, fg_color=self.STONE, bg_color=self.KEY, border_width=0)
         bar.pack()
         f = lambda size, w="bold": ctk.CTkFont(family="Segoe UI", size=size, weight=w)  # noqa: E731
         rb = dict(width=28, height=28, corner_radius=3, border_width=1, border_color=self.BRONZE_DIM,
