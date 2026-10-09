@@ -40,7 +40,6 @@ import numpy as np
 import cloud
 import font_reader
 import grid_finder
-import subprocess
 import updater
 
 MSS = getattr(mss, "MSS", None) or mss.mss
@@ -173,14 +172,51 @@ ACCENTS = {"Violet": ("#7c5cff", "#6847f5"), "Blue": ("#3b82f6", "#2563eb"), "Em
            "Rose": ("#f43f5e", "#e11d48"), "Amber": ("#f59e0b", "#d97706"), "Cyan": ("#06b6d4", "#0891b2")}
 
 
+PALETTE_KEYS = ("BG", "PANEL", "FG", "MUTED", "SIDEBAR", "CARD", "CARD2", "BORDER", "SELECT", "DANGER_H",
+                "ACCENT", "ACCENT_H")
+
+
+def _hex(c):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in c)
+
+
+def _rgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def palette():
+    return {k: globals()[k].lower() for k in PALETTE_KEYS}
+
+
 def apply_theme(theme, accent):
-    """Set the colour globals before the window is built."""
+    """Set the colour globals. accent: a name from ACCENTS or a custom "#rrggbb"."""
     g = globals()
     theme = theme if theme in THEMES else "Dark"
-    accent = accent if accent in ACCENTS else "Violet"
-    g["CURRENT_THEME"], g["CURRENT_ACCENT"] = theme, accent
+    if accent in ACCENTS:
+        acc, hov = ACCENTS[accent]
+    elif isinstance(accent, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", accent):
+        acc = accent.lower()
+        hov = _hex(v * 0.85 for v in _rgb(acc))
+    else:
+        accent = "Violet"
+        acc, hov = ACCENTS[accent]
     g.update(THEMES[theme])
-    g["ACCENT"], g["ACCENT_H"] = ACCENTS.get(accent, ACCENTS["Violet"])
+    # live recolouring swaps colours by value, so the accent must not equal any other colour in use
+    taken = {v.lower() for v in THEMES[theme].values()} | {c.lower() for c in (GOOD, BAD, WARN, CYAN, MUST_COL,
+                                                                             "#ffffff", "#000000")}
+    taken |= {c.lower() for c in PRESET_COLORS if c.startswith("#")}
+    if accent not in ACCENTS:
+        taken |= {c for pair in ACCENTS.values() for c in pair}
+
+    def free(c, avoid):
+        r, gg, b = _rgb(c)
+        while _hex((r, gg, b)) in avoid:
+            b = b + 1 if b < 255 else b - 1
+        return _hex((r, gg, b))
+    acc = free(acc, taken)
+    hov = free(hov, taken | {acc})
+    g["ACCENT"], g["ACCENT_H"] = acc, hov
+    g["CURRENT_THEME"], g["CURRENT_ACCENT"] = theme, accent
     ctk.set_appearance_mode("light" if theme == "Light" else "dark")
 MUST_COL = "#f5b041"
 KEY_COLOR = "#010203"  # overlay transparency key
@@ -1068,7 +1104,7 @@ class App:
 
         self._style()
         self.theme, self.accent = CURRENT_THEME, CURRENT_ACCENT    # set by apply_theme() at start
-        self._theme_at_start = (self.theme, self.accent)
+        self._page = "scan"
         self._build()
         self._load()
         self.overlay = Overlay(root)
@@ -1210,6 +1246,7 @@ class App:
         self._show_page("scan")
 
     def _show_page(self, key):
+        self._page = key
         for k, page in self.pages_ui.items():
             if k == key:
                 page.grid(row=0, column=0, sticky="nsew")
@@ -2181,28 +2218,51 @@ class App:
         self.upd_btn.pack(side="left", padx=10)
         self._render_update_card()
 
-        ac = self._card(pg, "Appearance", "Pick the app’s colours. The app restarts for a second to apply them.")
+        ac = self._card(pg, "Appearance", "Pick the app’s colours – they change right away.")
         ac.pack(fill="x", padx=28, pady=(0, 16))
         self.theme_var = ctk.StringVar(value=self.theme)
         ctk.CTkLabel(ac, text="Theme", font=self.f(12), text_color=MUTED, anchor="w").pack(fill="x", padx=18)
         ctk.CTkSegmentedButton(ac, values=list(THEMES), variable=self.theme_var, font=self.f(13),
                                selected_color=ACCENT, selected_hover_color=ACCENT_H, fg_color=CARD2,
                                unselected_color=CARD2, unselected_hover_color=BORDER, text_color=FG,
-                               command=lambda _v: self._theme_changed()).pack(anchor="w", padx=18, pady=(2, 12))
+                               command=lambda v: self._set_colors(theme=v)).pack(anchor="w", padx=18, pady=(2, 12))
         ctk.CTkLabel(ac, text="Accent colour", font=self.f(12), text_color=MUTED, anchor="w").pack(fill="x", padx=18)
         sw = ctk.CTkFrame(ac, fg_color="transparent")
-        sw.pack(anchor="w", padx=18, pady=(4, 18))
+        sw.pack(anchor="w", padx=18, pady=(4, 10))
         self.accent_btns = {}
         for name, (col, hov) in ACCENTS.items():
             b = ctk.CTkButton(sw, text="", width=34, height=34, corner_radius=17, fg_color=col, hover_color=hov,
-                              border_width=3 if name == self.accent else 0, border_color=FG,
-                              command=lambda n=name: self._accent_changed(n))
+                              border_color=FG, command=lambda n=name: self._set_colors(accent=n))
+            b._keep_colors = True        # a swatch shows its own colour, whatever the theme
             b.pack(side="left", padx=(0, 8))
             self.accent_btns[name] = b
-        self.theme_row = ctk.CTkFrame(ac, fg_color="transparent")      # shown once colours were changed
-        self.theme_lbl = ctk.CTkLabel(self.theme_row, text="", font=self.f(12), text_color=WARN, anchor="w")
-        self.theme_lbl.pack(side="left")
-        self.theme_btn = self._btn(self.theme_row, "Restart now", self._restart, kind="accent", width=130)
+        custom = self.accent if self.accent not in ACCENTS else ACCENT
+        b = ctk.CTkButton(sw, text="RGB", width=34, height=34, corner_radius=17, fg_color=custom,
+                          hover_color=custom, border_color=FG, text_color="white", font=self.f(9, "bold"),
+                          command=lambda: self._set_colors(accent=self._slider_hex()))
+        b._keep_colors = True
+        b.pack(side="left", padx=(6, 0))
+        self.accent_btns["custom"] = b
+        # custom accent: red / green / blue sliders, the app recolours live while dragging
+        self.rgb_vars, self.rgb_lbls = [], []
+        box = ctk.CTkFrame(ac, fg_color="transparent")
+        box.pack(fill="x", padx=18, pady=(0, 16))
+        for i, (ch, col) in enumerate((("R", "#e5484d"), ("G", "#30a46c"), ("B", "#3e63dd"))):
+            v = tk.IntVar(value=_rgb(custom)[i])
+            row = ctk.CTkFrame(box, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkLabel(row, text=ch, width=16, font=self.f(12, "bold"), text_color=MUTED).pack(side="left")
+            ctk.CTkSlider(row, from_=0, to=255, number_of_steps=255, variable=v, width=300, height=16,
+                          progress_color=col, button_color=col, button_hover_color=col, fg_color=CARD2,
+                          command=lambda _v: self._slider_moved()).pack(side="left", padx=8)
+            lbl = ctk.CTkLabel(row, text=str(v.get()), width=34, font=self.f(12), text_color=FG, anchor="e")
+            lbl.pack(side="left")
+            self.rgb_vars.append(v)
+            self.rgb_lbls.append(lbl)
+        self.hex_lbl = ctk.CTkLabel(box, text=custom.upper(), font=self.f(12), text_color=MUTED, anchor="w")
+        self.hex_lbl.pack(anchor="w", padx=24, pady=(2, 0))
+        self._slider_job = None
+        self._mark_accent()
 
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
                         "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
@@ -2236,35 +2296,114 @@ class App:
 
         return pg
 
-    def _theme_changed(self):
-        self.theme = self.theme_var.get()
-        self._save()
-        self._theme_pending()
+    def _slider_hex(self):
+        return _hex(v.get() for v in self.rgb_vars)
 
-    def _accent_changed(self, name):
-        self.accent = name
+    def _slider_moved(self):
+        h = self._slider_hex()
+        for v, lbl in zip(self.rgb_vars, self.rgb_lbls):
+            lbl.configure(text=str(v.get()))
+        self.hex_lbl.configure(text=h.upper())
+        self.accent_btns["custom"].configure(fg_color=h, hover_color=h)
+        if self._slider_job is None:      # recolour the app at most every 80 ms while dragging
+            self._slider_job = self.root.after(80, self._slider_apply)
+
+    def _slider_apply(self):
+        self._slider_job = None
+        self._set_colors(accent=self._slider_hex())
+
+    def _mark_accent(self):
+        sel = self.accent if self.accent in ACCENTS else "custom"
         for n, b in self.accent_btns.items():
-            b.configure(border_width=3 if n == name else 0)
-        self._save()
-        self._theme_pending()
+            b.configure(border_width=3 if n == sel else 0, border_color=FG)
+        if sel != "custom":      # sliders start from the picked colour, so it can be fine-tuned
+            for v, lbl, c in zip(self.rgb_vars, self.rgb_lbls, _rgb(ACCENT)):
+                v.set(c)
+                lbl.configure(text=str(c))
+            self.hex_lbl.configure(text=ACCENT.upper())
+            self.accent_btns["custom"].configure(fg_color=ACCENT, hover_color=ACCENT)
 
-    def _theme_pending(self):
-        if (self.theme, self.accent) == self._theme_at_start:
-            self.theme_row.pack_forget()
-        else:
-            self.theme_lbl.configure(text="New colours are saved – restart to see them.")
-            self.theme_btn.pack(side="right")
-            self.theme_row.pack(fill="x", padx=18, pady=(0, 16))
+    def _set_colors(self, theme=None, accent=None):
+        """Switch theme / accent live: every widget's old colours are swapped for the new ones."""
+        old = palette()
+        apply_theme(theme or self.theme, accent or self.accent)
+        self.theme, self.accent = CURRENT_THEME, CURRENT_ACCENT
+        new = palette()
+        swap = {}
+        for k in PALETTE_KEYS:
+            if old[k] != new[k]:
+                swap.setdefault(old[k], new[k])
+        if swap:
+            self._recolor(swap)
+        self._style()
+        self._gear = {"off": gear_icon(MUTED, 14), "on": gear_icon(FG, 14)}
+        self._show_page(self._page)
+        self._mark_accent()
+        if getattr(self, "_save_job", None):
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(600, self._save)
 
-    def _restart(self):
-        """Start a fresh copy of the app, then close this one."""
-        args = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
-        try:
-            subprocess.Popen(args, close_fds=True)
-        except Exception as e:
-            self._set_status(f"Couldn’t restart: {e}", BAD)
-            return
-        self._close()
+    CTK_COLOR_OPTS = ("fg_color", "bg_color", "hover_color", "text_color", "border_color", "button_color",
+                      "button_hover_color", "progress_color", "selected_color", "selected_hover_color",
+                      "unselected_color", "unselected_hover_color", "scrollbar_button_color",
+                      "scrollbar_button_hover_color", "placeholder_text_color", "text_color_disabled",
+                      "dropdown_fg_color", "dropdown_hover_color", "dropdown_text_color")
+    TK_COLOR_OPTS = ("bg", "fg", "selectbackground", "selectforeground", "highlightbackground",
+                     "highlightcolor", "insertbackground", "activebackground", "activeforeground")
+
+    def _recolor(self, swap):
+        """Swap colours by value in every widget. All current colours are read first and then
+        set, parents before children - so a colour a parent hands down to a child can't get
+        swapped a second time (Dark's text colour is Light's... card colour)."""
+        def remap(v):
+            if isinstance(v, str):
+                return swap.get(v.lower())
+            if isinstance(v, (tuple, list)) and any(isinstance(x, str) and x.lower() in swap for x in v):
+                return type(v)(swap.get(x.lower(), x) if isinstance(x, str) else x for x in v)
+            return None
+
+        skip = {str(w.win) for w in (getattr(self, "overlay", None), getattr(self, "minibar", None)) if w}
+        todo = []      # (setter, new value) in parent -> child order
+
+        def read(get, set_):
+            try:
+                nv = remap(get())
+            except Exception:
+                return
+            if nv is not None:
+                todo.append((set_, nv))
+
+        def walk(w):
+            if str(w) in skip:
+                return
+            internals = set()
+            if isinstance(w, ctk.CTkScrollableFrame):     # its colour lives in a hidden outer frame
+                read(lambda: w._parent_frame.cget("fg_color"), lambda v, w=w: w.configure(fg_color=v))
+                for o in ("scrollbar_button_color", "scrollbar_button_hover_color"):
+                    read(lambda o=o: w.cget(o), lambda v, w=w, o=o: w.configure(**{o: v}))
+            elif isinstance(w, (ctk.CTkBaseClass, ctk.CTk, ctk.CTkToplevel)):
+                opts = ("bg_color",) if getattr(w, "_keep_colors", False) else self.CTK_COLOR_OPTS
+                for o in opts:
+                    read(lambda o=o: w.cget(o), lambda v, w=w, o=o: w.configure(**{o: v}))
+                # private parts of a CTk widget (its own canvas, label...) follow the widget itself
+                internals = {id(x) for k, x in vars(w).items() if k.startswith("_") and isinstance(x, tk.Misc)}
+            else:
+                for o in self.TK_COLOR_OPTS:
+                    read(lambda o=o: w.cget(o), lambda v, w=w, o=o: w.configure(**{o: v}))
+                if isinstance(w, tk.Canvas):
+                    for item in w.find_all():
+                        for o in ("fill", "outline"):
+                            read(lambda i=item, o=o: w.itemcget(i, o),
+                                 lambda v, w=w, i=item, o=o: w.itemconfigure(i, **{o: v}))
+            for c in w.winfo_children():
+                if id(c) not in internals:
+                    walk(c)
+        walk(self.root)
+        for set_, v in todo:
+            try:
+                set_(v)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ config
     def _load(self):
