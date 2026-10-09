@@ -464,7 +464,9 @@ class FontReader:
 
     def _is_bonus_text(self, text):
         low = text.lower()
-        return any(b.lower() in low for b in self.names if b[0] not in "#=")
+        flat = re.sub(r"[^a-z0-9]", "", low)            # "Max.SP" == "Max. SP"
+        return any(b.lower() in low or flat.startswith(re.sub(r"[^a-z0-9]", "", b.lower()))
+                   for b in self.names if b[0] not in "#=")
 
     def clean_memory(self):
         """Forget pictures learned from teacher misreads: value pictures that don't look like
@@ -519,6 +521,23 @@ class FontReader:
                 self.teacher = RapidOCR(intra_op_num_threads=4)
             big = np.ascontiguousarray(np.repeat(np.repeat(rgb_crop, 2, 0), 2, 1))
             res, _ = self.teacher(big, use_det=False, use_cls=False)
+        if not res:
+            return ""
+        first = res[0]
+        return first[0] if isinstance(first, (list, tuple)) else str(first)
+
+    def _teach_clean(self, rgb_crop):
+        """Second try for the teacher: only the text, dark on white, 3x bigger - the item icons
+        behind the tooltip are gone."""
+        lay = text_layer(rgb_crop)
+        clean = np.clip((lay - FAINT) / 0.3, 0, 1)
+        dark = (255 - clean * 255).astype(np.uint8)
+        big = np.pad(np.kron(dark, np.ones((3, 3), np.uint8)), ((12, 12), (16, 16)), constant_values=255)
+        with self.teacher_lock:
+            if self.teacher is None:
+                from rapidocr_onnxruntime import RapidOCR
+                self.teacher = RapidOCR(intra_op_num_threads=4)
+            res, _ = self.teacher(np.ascontiguousarray(np.stack([big] * 3, -1)), use_det=False, use_cls=False)
         if not res:
             return ""
         first = res[0]
@@ -666,8 +685,15 @@ class FontReader:
             lst.append(pic.copy())
             self._ver += 1
 
-    def _learn_line(self, ln, text):
-        """Store pictures for a line the teacher read as `text`. Returns (kind, payload)."""
+    @staticmethod
+    def _clean_number(text, tok):
+        """The teacher's number must stand on its own: "MaxSP ly400" is not 400 (it's +1,400
+        with the "+1," misread) - a number glued to letters is never trusted."""
+        return re.search(r"(?<![A-Za-z0-9.,])" + re.escape(tok) + r"(?![A-Za-z0-9])", text) is not None
+
+    def _learn_line(self, ln, text, arts_zone=False):
+        """Store pictures for a line the teacher read as `text`. Returns (kind, payload).
+        arts_zone: the line is one of the 7 bonuses (between the base stats and [Pet Artifact])."""
         img, words = _clean(ln["img"]), ln["words"]
         key = self._special_key(text)
         found = self.parse_text(text) if key[0] == "=" else []
@@ -682,14 +708,16 @@ class FontReader:
                 lo, hi = self.bonus_range(bonus)
                 if not (VALUE_TOKEN.match(vtok) and lo <= _num(vtok) <= hi):
                     return None, None
+                # never a wrong value: the number must stand alone and fit the value's width
+                if not self._clean_number(text, vtok) or not self._plausible_token(vtok, vpic):
+                    return None, None
                 # the per-character reading must agree with the teacher, or neither is trusted
                 seen = self._read_glyphs(vpic, self._indexes()[3])
                 if seen and seen.lstrip("+") != vtok.lstrip("+"):
                     return None, None
                 with self.lock:
                     self._add(self.names, bonus, npic)
-                    if self._plausible_token(vtok, vpic):
-                        self._add(self.tokens, vtok, vpic)
+                    self._add(self.tokens, vtok, vpic)
                     segs = _segments((vpic > 0.35).any(0), 1)
                     if len(segs) == len(vtok):
                         for (a, b), ch in zip(segs, vtok):
@@ -703,8 +731,11 @@ class FontReader:
             # but never store it as "other text" (it would hide the bonus next time)
             bonus, value = found[0]
             lo, hi = self.bonus_range(bonus)
+            nums = re.findall(r"\+?\d[\d,]*%?", text)
+            if not nums or not any(self._clean_number(text, t) and _num(t) == value for t in nums):
+                return None, None
             return ("bonus", (bonus, value)) if lo <= value <= hi else (None, None)
-        if key[0] == "=" and self._is_bonus_text(key[1:]):
+        if arts_zone or (key[0] == "=" and self._is_bonus_text(key[1:])):
             return None, None      # a bonus line the teacher misread: don't remember it as text
         with self.lock:
             self._add(self.names, key, img)
@@ -716,17 +747,26 @@ class FontReader:
         -> (item name, [(bonus, value)] arts, debug text lines[, tooltip box (x0, y0, x1, y1)])"""
         lines = find_lines(rgb, cx, y_from)       # y_from: slot row in the capture (tooltip opens below)
         out, learned = [], False
+        arts_zone = False                          # after "Defense against Magic Power": the 7 bonuses
         for ln in lines:
             kind, payload, text = self._classify(ln)
             if kind is None and teach:
                 y, x0, x1 = ln["y"], ln["x0"], ln["x1"]
-                text = self._teach_text(rgb[max(0, y - 1):y + LINE_H + 1, max(0, x0 - 3):x1 + 3])
+                crop = rgb[max(0, y - 1):y + LINE_H + 1, max(0, x0 - 3):x1 + 3]
+                text = self._teach_text(crop)
                 self.stats["taught"] += 1
                 if text:
-                    kind, payload = self._learn_line(ln, text)
+                    kind, payload = self._learn_line(ln, text, arts_zone)
                     learned = True
+                if kind is None and arts_zone:      # icons behind the text: try once more, text only
+                    text2 = self._teach_clean(crop)
+                    if text2:
+                        kind, payload = self._learn_line(ln, text2, arts_zone)
+                        text = text2 if kind else text
             elif kind is not None:
                 self.stats["fast"] += 1
+            if kind == "#defense":
+                arts_zone = True
             out.append((kind, payload, text))
             if kind == "#petart":
                 break
