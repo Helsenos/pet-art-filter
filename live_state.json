@@ -1,14 +1,14 @@
 {
- "time": "00:28:02",
+ "time": "00:33:17",
  "version": "1.1.10",
  "scanning": false,
- "page_shown": "scan",
+ "page_shown": "filter",
  "marks": {},
  "mark_colors": {},
  "pages": {},
  "cover": null,
  "overlay_items": 0,
- "overlay_visible": true,
+ "overlay_visible": false,
  "overlay_topmost": true,
  "game_exe": null,
  "game_known": false,
@@ -18,6 +18,18 @@
    "rainbow",
    true,
    0
+  ],
+  [
+   "Preset 2",
+   "#34d399",
+   true,
+   0
+  ],
+  [
+   "Preset 2 copy",
+   "#34d399",
+   true,
+   4
   ]
  ],
  "loop_ms_max": 0.1,

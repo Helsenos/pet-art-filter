@@ -3631,6 +3631,11 @@ class App:
         self._closing = True
         self._save()
         self._stop()
+        try:                                   # nothing scheduled may run after the window is gone
+            for job in self.root.tk.call("after", "info"):
+                self.root.after_cancel(job)
+        except tk.TclError:
+            pass
         self.root.destroy()
 
     # ------------------------------------------------------------ evaluation
