@@ -34,7 +34,7 @@ from tkinter import ttk, simpledialog, messagebox
 import customtkinter as ctk
 
 import mss
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageStat, ImageTk
 import numpy as np
 
 import cloud
@@ -186,6 +186,24 @@ def _rgb(h):
 
 def palette():
     return {k: globals()[k].lower() for k in PALETTE_KEYS}
+
+
+def rainbow_color(hue):
+    """Accent colour at a spot on the rainbow strip (hue 0..360, same brightness everywhere)."""
+    return _hex(c * 255 for c in colorsys.hls_to_rgb(hue / 360, 0.55, 0.8))
+
+
+def rainbow_strip(w, h):
+    """The rainbow pill as an RGBA image (smooth rounded ends)."""
+    from PIL import ImageDraw
+    k = 4
+    cols = Image.new("RGB", (w, 1))
+    cols.putdata([_rgb(rainbow_color(x / w * 360)) for x in range(w)])
+    img = cols.resize((w, h)).convert("RGBA")
+    mask = Image.new("L", (w * k, h * k), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * k - 1, h * k - 1), radius=h * k // 2, fill=255)
+    img.putalpha(mask.resize((w, h), Image.LANCZOS))
+    return img
 
 
 def apply_theme(theme, accent):
@@ -2236,32 +2254,22 @@ class App:
             b._keep_colors = True        # a swatch shows its own colour, whatever the theme
             b.pack(side="left", padx=(0, 8))
             self.accent_btns[name] = b
-        custom = self.accent if self.accent not in ACCENTS else ACCENT
-        b = ctk.CTkButton(sw, text="RGB", width=34, height=34, corner_radius=17, fg_color=custom,
-                          hover_color=custom, border_color=FG, text_color="white", font=self.f(9, "bold"),
-                          command=lambda: self._set_colors(accent=self._slider_hex()))
-        b._keep_colors = True
-        b.pack(side="left", padx=(6, 0))
-        self.accent_btns["custom"] = b
-        # custom accent: red / green / blue sliders, the app recolours live while dragging
-        self.rgb_vars, self.rgb_lbls = [], []
-        box = ctk.CTkFrame(ac, fg_color="transparent")
-        box.pack(fill="x", padx=18, pady=(0, 16))
-        for i, (ch, col) in enumerate((("R", "#e5484d"), ("G", "#30a46c"), ("B", "#3e63dd"))):
-            v = tk.IntVar(value=_rgb(custom)[i])
-            row = ctk.CTkFrame(box, fg_color="transparent")
-            row.pack(fill="x", pady=1)
-            ctk.CTkLabel(row, text=ch, width=16, font=self.f(12, "bold"), text_color=MUTED).pack(side="left")
-            ctk.CTkSlider(row, from_=0, to=255, number_of_steps=255, variable=v, width=300, height=16,
-                          progress_color=col, button_color=col, button_hover_color=col, fg_color=CARD2,
-                          command=lambda _v: self._slider_moved()).pack(side="left", padx=8)
-            lbl = ctk.CTkLabel(row, text=str(v.get()), width=34, font=self.f(12), text_color=FG, anchor="e")
-            lbl.pack(side="left")
-            self.rgb_vars.append(v)
-            self.rgb_lbls.append(lbl)
-        self.hex_lbl = ctk.CTkLabel(box, text=custom.upper(), font=self.f(12), text_color=MUTED, anchor="w")
-        self.hex_lbl.pack(anchor="w", padx=24, pady=(2, 0))
-        self._slider_job = None
+        # your own colour: drag along the rainbow, the app recolours live
+        sc = ctk.ScalingTracker.get_widget_scaling(ac)
+        self._strip_w, self._strip_h = int(440 * sc), int(24 * sc)
+        self._strip_pad = self._strip_h // 2 + int(6 * sc)      # room for the ring at both ends
+        self.strip = tk.Canvas(ac, width=self._strip_w + 2 * self._strip_pad,
+                               height=self._strip_h + 2 * self._strip_pad, bg=CARD, highlightthickness=0,
+                               cursor="hand2")
+        self.strip.pack(anchor="w", padx=max(0, 18 - self._strip_pad), pady=(0, 12))
+        self._strip_img = ImageTk.PhotoImage(rainbow_strip(self._strip_w, self._strip_h))
+        self.strip.create_image(self._strip_pad, self._strip_pad, image=self._strip_img, anchor="nw")
+        self._strip_edge = self.strip.create_oval(0, 0, 1, 1, width=1, outline="#3a4050")   # visible on light too
+        self._strip_ring = self.strip.create_oval(0, 0, 1, 1, width=3, outline="#ffffff")
+        self._strip_job = None
+        for ev in ("<Button-1>", "<B1-Motion>"):
+            self.strip.bind(ev, self._strip_drag)
+        self.strip.bind("<ButtonRelease-1>", lambda e: self._strip_drag(e, final=True))
         self._mark_accent()
 
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
@@ -2296,32 +2304,35 @@ class App:
 
         return pg
 
-    def _slider_hex(self):
-        return _hex(v.get() for v in self.rgb_vars)
+    def _strip_drag(self, e, final=False):
+        x = min(max(e.x - self._strip_pad, 0), self._strip_w - 1)
+        self._strip_hue = x / self._strip_w * 360
+        self._place_ring(self._strip_hue)
+        if final:
+            if self._strip_job:
+                self.root.after_cancel(self._strip_job)
+            self._strip_apply()
+        elif self._strip_job is None:     # recolour the app at most every 80 ms while dragging
+            self._strip_job = self.root.after(80, self._strip_apply)
 
-    def _slider_moved(self):
-        h = self._slider_hex()
-        for v, lbl in zip(self.rgb_vars, self.rgb_lbls):
-            lbl.configure(text=str(v.get()))
-        self.hex_lbl.configure(text=h.upper())
-        self.accent_btns["custom"].configure(fg_color=h, hover_color=h)
-        if self._slider_job is None:      # recolour the app at most every 80 ms while dragging
-            self._slider_job = self.root.after(80, self._slider_apply)
+    def _strip_apply(self):
+        self._strip_job = None
+        self._set_colors(accent=rainbow_color(self._strip_hue))
 
-    def _slider_apply(self):
-        self._slider_job = None
-        self._set_colors(accent=self._slider_hex())
+    def _place_ring(self, hue):
+        x = self._strip_pad + hue / 360 * self._strip_w
+        r = self._strip_h / 2 + 3
+        cy = self._strip_pad + self._strip_h / 2
+        self.strip.coords(self._strip_ring, x - r, cy - r, x + r, cy + r)
+        self.strip.coords(self._strip_edge, x - r - 2, cy - r - 2, x + r + 2, cy + r + 2)
+        self.strip.itemconfigure(self._strip_ring, fill=rainbow_color(hue))
 
     def _mark_accent(self):
-        sel = self.accent if self.accent in ACCENTS else "custom"
         for n, b in self.accent_btns.items():
-            b.configure(border_width=3 if n == sel else 0, border_color=FG)
-        if sel != "custom":      # sliders start from the picked colour, so it can be fine-tuned
-            for v, lbl, c in zip(self.rgb_vars, self.rgb_lbls, _rgb(ACCENT)):
-                v.set(c)
-                lbl.configure(text=str(c))
-            self.hex_lbl.configure(text=ACCENT.upper())
-            self.accent_btns["custom"].configure(fg_color=ACCENT, hover_color=ACCENT)
+            b.configure(border_width=3 if n == self.accent else 0, border_color=FG)
+        # the ring sits at the accent's hue (presets included)
+        r, g, b = (c / 255 for c in _rgb(ACCENT))
+        self._place_ring(colorsys.rgb_to_hls(r, g, b)[0] * 360)
 
     def _set_colors(self, theme=None, accent=None):
         """Switch theme / accent live: every widget's old colours are swapped for the new ones."""
