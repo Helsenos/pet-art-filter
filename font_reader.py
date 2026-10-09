@@ -250,6 +250,37 @@ def _find_lines(rgb, cx, need_frame=False):
     return out
 
 
+def _tint_line(rgb, ln):
+    """Second look at a line that couldn't be read: every tooltip line is written in ONE
+    colour, so keep only the pixels of the line's main text colour - specks of the item
+    icons behind the tooltip in other colours disappear. -> new line dict or None."""
+    y, x0, x1 = ln["y"], ln["x0"] - 2, ln["x1"] + 2
+    crop = rgb[y:y + LINE_H, max(0, x0):x1]
+    if crop.shape[0] < LINE_H or crop.shape[1] < 4:
+        return None
+    px = crop.reshape(-1, 3).astype(np.float32)
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    aa, bright = r * r + g * g + b * b, px.max(1) >= 60
+    best, best_n = None, 0
+    for c, cc in _TINTS:
+        dot = r * c[0] + g * c[1] + b * c[2]
+        s_ = dot / cc
+        ok = bright & (s_ > 0.3) & (s_ < 1.15) & (aa - dot * dot / cc < 256)
+        lay = np.where(ok, np.minimum(s_, 1.0), 0).astype(np.float32)
+        n = int((lay > STRONG).sum())
+        if n > best_n:
+            best, best_n = lay, n
+    if best is None:
+        return None
+    img = best.reshape(crop.shape[:2])
+    cols = np.flatnonzero((img > STRONG).any(0))
+    if len(cols) == 0:
+        return None
+    img = img[:, cols[0]:cols[-1] + 1]
+    return {"y": y, "x0": max(0, x0) + int(cols[0]), "x1": max(0, x0) + int(cols[-1]) + 1,
+            "img": img, "words": _segments((img > STRONG).any(0), SPACE)}
+
+
 def _wwin(col):
     """worst 4-column window of per-column differences (rows = candidates)."""
     if col.shape[-1] <= 4:
@@ -752,6 +783,12 @@ class FontReader:
             if i >= 3 and not any(k == "#plvl" for k, _, _ in out):
                 break      # not a pet art (its 2nd line is always "From PLvl"): don't read the rest
             kind, payload, text = self._classify(ln)
+            if kind is None:                       # icon specks? look again in the line's own colour
+                ln2 = _tint_line(rgb, ln)
+                if ln2 is not None:
+                    k2 = self._classify(ln2)
+                    if k2[0] is not None:
+                        kind, payload, text = k2
             if kind is None and teach:
                 y, x0, x1 = ln["y"], ln["x0"], ln["x1"]
                 crop = rgb[max(0, y - 1):y + LINE_H + 1, max(0, x0 - 3):x1 + 3]
