@@ -50,6 +50,7 @@ except ImportError:
     winsound = None
 
 user32 = ctypes.windll.user32
+dwmapi = ctypes.windll.dwmapi
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -161,6 +162,37 @@ def _mix(col, t):
 
 
 _re_hex = re.compile(r"^#[0-9a-fA-F]{6}$")
+_SAFE = {}
+
+
+def safe_color(col):
+    """The overlay is visible in screenshots (so screen recorders work), therefore it must
+    never use a colour the reader treats as tooltip text. Such colours are shifted a few
+    degrees in hue / a bit in saturation until they aren't text-like. Cached."""
+    hit = _SAFE.get(col)
+    if hit:
+        return hit
+    rgb = tuple(int(col[i:i + 2], 16) for i in (1, 3, 5))
+
+    def texty(c):
+        return font_reader.text_layer_exact(np.array([[c]], np.float32))[0, 0] > 0
+
+    out = col
+    if texty(rgb):
+        h, s_, v = colorsys.rgb_to_hsv(*(x / 255 for x in rgb))
+        for k in range(1, 60):
+            for dh, ds in ((0.006 * k, 0), (-0.006 * k, 0), (0, -0.015 * k), (0.004 * k, -0.01 * k)):
+                c = tuple(int(x * 255) for x in colorsys.hsv_to_rgb((h + dh) % 1, min(1, max(0, s_ + ds)), v))
+                if not texty(c):
+                    out = "#%02x%02x%02x" % c
+                    break
+            else:
+                continue
+            break
+        else:
+            out = "#ff00ff"      # fallback: magenta is never text
+    _SAFE[col] = out
+    return out
 
 
 def _swatch(col):
@@ -425,8 +457,9 @@ class Scanner(threading.Thread):
     """Follows the mouse. Each time it sits on a new slot for `delay` ms, grabs
     the area where the tooltip shows up and queues it for OCR."""
 
-    def __init__(self, grids, pages, icons, marks, cap, delay_ms, ocr_q, event_q):
+    def __init__(self, grids, pages, icons, marks, cap, delay_ms, ocr_q, event_q, hide_overlay=None):
         super().__init__(daemon=True)
+        self.hide_overlay = hide_overlay   # (hwnd, is_on) in screen-recording mode
         self.grids, self.pages, self.icons, self.marks, self.cap = grids, pages, icons, marks, cap
         self.delay = delay_ms / 1000.0
         self.ocr_q, self.event_q = ocr_q, event_q
@@ -459,6 +492,11 @@ class Scanner(threading.Thread):
                             cur = (gi, pg, r, c)
                     x0, y0, x1, y1 = slot_rect(self.grids[gi], r, c)
                     grabbed = True
+                    hide = self.hide_overlay and self.hide_overlay[1]()
+                    if hide:   # recording mode: take the glow off the screen for one frame
+                        user32.ShowWindowAsync(self.hide_overlay[0], 0)
+                        dwmapi.DwmFlush()
+                        dwmapi.DwmFlush()
                     # Already read this slot and the item icon still looks the same?
                     # Then it's the same pet art, skip it.
                     ix, iy = (x1 - x0) * 0.3, (y1 - y0) * 0.3
@@ -470,6 +508,8 @@ class Scanner(threading.Thread):
                     same_item = old is not None and old.size == icon.size and \
                         sum(ImageStat.Stat(ImageChops.difference(old, icon)).mean) / 3 < 8
                     if same_item and self.marks.get(cur) in ("good", "bad"):
+                        if hide:
+                            user32.ShowWindowAsync(self.hide_overlay[0], 8)
                         time.sleep(0.004)
                         continue   # same pet art, already fully read
                     self.icons[cur] = icon
@@ -481,6 +521,8 @@ class Scanner(threading.Thread):
                     shot = sct.grab({"left": left, "top": top,
                                      "width": right - left, "height": bottom - top})
                     img = Image.frombytes("RGB", shot.size, shot.rgb)
+                    if hide:
+                        user32.ShowWindowAsync(self.hide_overlay[0], 8)   # SW_SHOWNA: back, no focus change
                     self.seq += 1
                     self.ocr_q.put((self.seq, cur, img, cx - left, same_item))
                     self.event_q.put(("grabbed", cur))
@@ -640,12 +682,8 @@ class Overlay:
         ex = user32.GetWindowLongW(hwnd, -20)
         # layered | transparent (click-through) | toolwindow (no taskbar entry)
         user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80)
-        # keep the glow / X marks out of screenshots so they never cover tooltip text
-        # for the OCR (you still see them on screen). WDA_EXCLUDEFROMCAPTURE = 0x11
-        try:
-            user32.SetWindowDisplayAffinity(hwnd, 0x11)
-        except Exception:
-            pass
+        self.hwnd = hwnd
+        self.set_capture_mode(True)
         self.pulse = False
         self.phase = 0.0
         self.ticks = 0
@@ -654,6 +692,15 @@ class Overlay:
         self.pages = {}
         self.colors = {}
         self._tick()
+
+    def set_capture_mode(self, hide_from_capture):
+        """True: Windows keeps the glow out of every screenshot (best for reading, but
+        NVIDIA/OBS then refuse to record: "protected application"). False: recorders work;
+        the Scanner hides the glow for one frame while it grabs a tooltip instead."""
+        try:
+            user32.SetWindowDisplayAffinity(self.hwnd, 0x11 if hide_from_capture else 0)
+        except Exception:
+            pass
 
     def _tick(self):
         self.ticks += 1
@@ -670,8 +717,9 @@ class Overlay:
 
     @staticmethod
     def _hue(h):
-        r, g, b = colorsys.hsv_to_rgb(h % 1.0, 1.0, 1.0)
-        return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+        h = round(h % 1.0, 3)
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        return safe_color(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
 
     def set(self, grids, marks, show_grid, show_scanned, pages, colors=None):
         self.state = (grids, marks, show_grid, show_scanned)
@@ -694,7 +742,7 @@ class Overlay:
                 for r in range(g["rows"]):
                     for c in range(g["cols"]):
                         x0, y0, x1, y1 = slot_rect(g, r, c)
-                        cv.create_rectangle(x0 - ox, y0 - oy, x1 - ox, y1 - oy, outline="#5b8cff")
+                        cv.create_rectangle(x0 - ox, y0 - oy, x1 - ox, y1 - oy, outline=safe_color("#5b8cff"))
             for gi, g in enumerate(grids):
                 t = g.get("tabs")
                 if not t:
@@ -703,7 +751,7 @@ class Overlay:
                     x0, y0, x1, y1 = tab_rect(t, i)
                     on = self.pages.get(gi, 0) == i
                     cv.create_rectangle(x0 - ox, y0 - oy, x1 - ox, y1 - oy,
-                                        outline=GOOD if on else "#e0b040", width=3 if on else 1)
+                                        outline=safe_color(GOOD if on else "#e0b040"), width=3 if on else 1)
         for (gi, pg, r, c), status in marks.items():
             if gi >= len(grids) or pg != self.pages.get(gi, 0):
                 continue
@@ -724,18 +772,18 @@ class Overlay:
                                            fill=self._hue(h + side * 0.25 + k * 0.12))
                     else:
                         glow = col if (self.pulse or len(cols) > 1) else _mix(col, 0.45)
-                        cv.create_rectangle(a0, b0, a1, b1, outline=glow, width=w)
+                        cv.create_rectangle(a0, b0, a1, b1, outline=safe_color(glow), width=w)
             elif status == "incomplete":
-                cv.create_line(x0 + 5, y0 + 5, x1 - 5, y1 - 5, fill="#ff2a2a", width=4)
-                cv.create_line(x1 - 5, y0 + 5, x0 + 5, y1 - 5, fill="#ff2a2a", width=4)
+                cv.create_line(x0 + 5, y0 + 5, x1 - 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
+                cv.create_line(x1 - 5, y0 + 5, x0 + 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
             elif status == "missed":
-                cv.create_oval(x1 - 10, y0 + 3, x1 - 3, y0 + 10, fill=WARN, outline="")
+                cv.create_oval(x1 - 10, y0 + 3, x1 - 3, y0 + 10, fill=safe_color(WARN), outline="")
             elif show_scanned and status == "bad":
-                cv.create_line(x0 + 4, y1 - 4, x1 - 4, y1 - 4, fill=BAD, width=2)
+                cv.create_line(x0 + 4, y1 - 4, x1 - 4, y1 - 4, fill=safe_color(BAD), width=2)
         if self.flash_slot and self.flash_slot[0] < len(grids):
             gi, pg, r, c = self.flash_slot
             g = grids[gi]
-            col = "#ffffff" if self.pulse else ACCENT
+            col = safe_color("#ffffff" if self.pulse else ACCENT)
             if g.get("tabs") and pg != self.pages.get(gi, 0):
                 # item is on another page: flash that page's button instead
                 x0, y0, x1, y1 = tab_rect(g["tabs"], pg)
@@ -853,6 +901,7 @@ class App:
         self.show_scanned = tk.BooleanVar(value=True)
         self.only_good = tk.BooleanVar(value=False)
         self.on_top = tk.BooleanVar(value=False)
+        self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
         self.market_match = tk.BooleanVar(value=False)
         self.seller = ""
         self.contact = ""
@@ -861,6 +910,8 @@ class App:
         self._build()
         self._load()
         self.overlay = Overlay(root)
+        self._rec_on = self.rec_mode.get()
+        self.overlay.set_capture_mode(not self._rec_on)
         self._refresh_overlay()
 
         self.reader = font_reader.FontReader(
@@ -1894,6 +1945,15 @@ class App:
             sl.bind("<ButtonRelease-1>", lambda e: self._save())
             self.setup_sliders = getattr(self, "setup_sliders", []) + [(sl, var, val, unit)]
 
+        rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
+                        "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
+                        "tooltip text the app reads – recorders see that as a “protected application” and "
+                        "refuse to record. In recording mode the glow blinks off for one frame each time a tooltip is "
+                        "read instead.")
+        rc.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkSwitch(rc, text="Screen-recording friendly", variable=self.rec_mode, progress_color=ACCENT,
+                      font=self.f(13), text_color=FG, command=self._set_rec_mode).pack(anchor="w", padx=18, pady=(4, 16))
+
         lc = self._card(pg, "Font memory", "The app learns your game’s font while you hover. "
                         "New words are read once by the slower teacher, then recognised instantly.")
         lc.pack(fill="x", padx=28, pady=(0, 16))
@@ -1957,7 +2017,7 @@ class App:
         return {"min_matches": self.min_matches, "delay_ms": self.delay_ms,
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
-                "beep": self.beep, "show_scanned": self.show_scanned}
+                "beep": self.beep, "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode}
 
     def _save(self):
         cfg = {}
@@ -2162,6 +2222,13 @@ class App:
             self._refresh_grid_list()
             self._save()
 
+    def _set_rec_mode(self):
+        self._rec_on = self.rec_mode.get()
+        self.overlay.set_capture_mode(not self._rec_on)
+        self._save()
+        self._set_status("Screen recording allowed – the glow blinks briefly when a tooltip is read."
+                         if self._rec_on else "Glow hidden from screenshots again (best reading).", ACCENT)
+
     def _refresh_overlay(self):
         if hasattr(self, "overlay"):
             self.overlay.set(self.grids, self.marks, self.show_grid.get(), self.show_scanned.get(),
@@ -2181,7 +2248,8 @@ class App:
         self._refresh_overlay()
         cap = {"width": self._int(self.cap_width, 480), "above": self._int(self.cap_above, 520),
                "below": self._int(self.cap_below, 480)}
-        self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, self._int(self.delay_ms, 60), self.ocr_q, self.event_q)
+        self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, self._int(self.delay_ms, 60),
+                               self.ocr_q, self.event_q, hide_overlay=(self.overlay.hwnd, lambda: self._rec_on))
         self.scanner.start()
         self._set_scanning(True)
 
