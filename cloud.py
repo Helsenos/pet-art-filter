@@ -39,9 +39,10 @@ def _req(method, path, body=None, params=None):
     if params:
         url += "?" + urllib.parse.urlencode(params)
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json", "Accept": "application/json"})
+    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json", "Accept": "application/json"}
+    if SUPABASE_KEY.startswith("eyJ"):    # legacy anon key (a JWT); new sb_publishable_ keys go in apikey only
+        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             raw = r.read()
