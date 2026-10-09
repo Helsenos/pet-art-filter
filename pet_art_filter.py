@@ -3929,10 +3929,16 @@ if __name__ == "__main__":
     root = ctk.CTk()
     root.withdraw()                    # shown by app.boot() (after the intro)
     app = App(root)
-    try:
-        import pyi_splash              # the .exe's loading picture: the app is ready now
-        pyi_splash.close()
-    except Exception:
-        pass
-    app.boot()
+
+    def _ready():
+        try:
+            import pyi_splash          # the .exe's loading picture: the app is ready now
+            pyi_splash.close()
+        except Exception:
+            pass
+        app.boot()
+    # show the window only once the main loop runs: CustomTkinter hides a window that was
+    # withdrawn before the loop started (its first-start title-bar step) - shown too early,
+    # the window would vanish again
+    root.after(100, _ready)
     root.mainloop()

@@ -1,14 +1,14 @@
 {
- "time": "23:50:43",
+ "time": "00:28:02",
  "version": "1.1.10",
  "scanning": false,
- "page_shown": "settings",
+ "page_shown": "scan",
  "marks": {},
  "mark_colors": {},
  "pages": {},
  "cover": null,
  "overlay_items": 0,
- "overlay_visible": false,
+ "overlay_visible": true,
  "overlay_topmost": true,
  "game_exe": null,
  "game_known": false,
@@ -20,6 +20,6 @@
    0
   ]
  ],
- "loop_ms_max": 0.7,
+ "loop_ms_max": 0.1,
  "ocr_queue": 0
 }
