@@ -143,6 +143,10 @@ PRESET_COLORS = ["rainbow", "#34d399", "#fbbf24", "#22d3ee", "#f472b6", "#a78bfa
                  "#ffffff"]
 OCR_WORKERS = 3
 OCR_SCALES = (2.5, 3.0)  # each tooltip is read at these zooms and the results merged
+# Grab settings measured on real tooltips (74 captures): a pet art tooltip is 403 px tall,
+# reaches at most 459 px below the slot and 169 px to the side of its centre.
+TOOLTIP_DELAY_MS = 50
+CAPTURE = {"width": 440, "above": 460, "below": 480}
 ARTS_PER_PET = 7  # every pet art has 7 bonuses; fewer read = OCR missed some
 
 BG, PANEL, FG, MUTED = "#0c0f16", "#151a25", "#e9edf5", "#8790a5"
@@ -2024,37 +2028,6 @@ class App:
                       progress_color=ACCENT, font=self.f(13), text_color=FG,
                       command=self._refresh_overlay).pack(side="left", padx=24)
 
-        sp = self._card(pg, "Speed & tooltip area", "Tooltip delay is how long the mouse must rest on a slot "
-                        "before it’s grabbed. Lower is faster; if it’s too low you get yellow dots "
-                        "(missed slots) – just hover those again.")
-        sp.pack(fill="x", padx=28, pady=(0, 16))
-        grid = ctk.CTkFrame(sp, fg_color="transparent")
-        grid.pack(fill="x", padx=18, pady=(6, 16))
-        grid.grid_columnconfigure(1, weight=1)
-        for i, (label, var, lo, hi, step, unit) in enumerate([
-                ("Tooltip delay", self.delay_ms, 15, 500, 5, "ms"),
-                ("Capture width", self.cap_width, 200, 1200, 20, "px"),
-                ("Capture above slot", self.cap_above, 0, 1400, 20, "px"),
-                ("Capture below slot", self.cap_below, 0, 1400, 20, "px")]):
-            ctk.CTkLabel(grid, text=label, font=self.f(13), text_color=FG, anchor="w", width=170
-                         ).grid(row=i, column=0, sticky="w", pady=6)
-            val = ctk.CTkLabel(grid, text=f"{var.get()} {unit}", font=self.f(13, "bold"), text_color=CYAN,
-                               width=80, anchor="e")
-            val.grid(row=i, column=2, sticky="e")
-
-            def moved(v, var=var, lbl=val, st=step, lo_=lo, u=unit):
-                iv = int(round((v - lo_) / st) * st + lo_)
-                var.set(iv)
-                lbl.configure(text=f"{iv} {u}")
-
-            sl = ctk.CTkSlider(grid, from_=lo, to=hi, number_of_steps=(hi - lo) // step, command=moved,
-                               progress_color=ACCENT, button_color=ACCENT, button_hover_color=FG,
-                               fg_color=CARD2, height=16)
-            sl.set(var.get())
-            sl.grid(row=i, column=1, sticky="ew", padx=14)
-            sl.bind("<ButtonRelease-1>", lambda e: self._save())
-            self.setup_sliders = getattr(self, "setup_sliders", []) + [(sl, var, val, unit)]
-
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
                         "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
                         "tooltip text the app reads – recorders see that as a “protected application” and "
@@ -2369,9 +2342,8 @@ class App:
         self._save()
         self.show_grid.set(False)
         self._refresh_overlay()
-        cap = {"width": self._int(self.cap_width, 480), "above": self._int(self.cap_above, 520),
-               "below": self._int(self.cap_below, 480)}
-        self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, self._int(self.delay_ms, 60),
+        cap = dict(CAPTURE)
+        self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, TOOLTIP_DELAY_MS,
                                self.ocr_q, self.event_q,
                                hide_overlay=((self.overlay.hwnd, self.minibar.hwnd), lambda: self._rec_on))
         self.scanner.start()

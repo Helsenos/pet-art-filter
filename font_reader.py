@@ -39,6 +39,8 @@ USE_DP = True      # read unseen values character by character
 SPECK_TOL = 0.27   # names: a speck next to the text may push the worst-window score up to this...
 SPECK_MEAN = 0.08  # ...if the average difference over the whole word stays this small
 SPECK_RATIO = 0.62 # ...and the best name is clearly better than any other (d1 <= 0.62 * d2)
+GLYPH_SPECK = True
+PREFIX_MATCH = True  # speck-proof fallback for bonus lines (see _prefix_match) # characters may use the speck-tolerant match too
 MAX_PICS = 6
 VALUE_TOKEN = re.compile(r"^\+?\d{1,3}(,\d{3})*%?$")
 
@@ -349,6 +351,7 @@ class FontReader:
             self.glyphs = d.get("glyphs", {})
         except Exception:
             pass
+        self.clean_memory()
 
     def save(self):
         with self.lock:
@@ -367,6 +370,40 @@ class FontReader:
                 self.names.pop(k)
             self._ver += 1
         return bad
+
+    @staticmethod
+    def _plausible_token(tok, pic):
+        """A value picture must be about as wide as its text (~4-8 px per character)."""
+        return 4 * len(tok) <= pic.shape[1] <= 8 * len(tok) + 6
+
+    def _is_bonus_text(self, text):
+        low = text.lower()
+        return any(b.lower() in low for b in self.names if b[0] not in "#=")
+
+    def clean_memory(self):
+        """Forget pictures learned from teacher misreads: value pictures that don't look like
+        their text (e.g. "+2,700" stored as "700"), and bonus lines stored as plain text
+        (which would make the reader skip that bonus forever)."""
+        gidx = self._indexes()[3]
+        with self.lock:
+            n = 0
+            for tok in list(self.tokens):
+                keep = []
+                for pic in self.tokens[tok]:
+                    seen = self._read_glyphs(pic, gidx)
+                    if self._plausible_token(tok, pic) and not (seen and seen.lstrip("+") != tok.lstrip("+")):
+                        keep.append(pic)
+                n += len(self.tokens[tok]) - len(keep)
+                if keep:
+                    self.tokens[tok] = keep
+                else:
+                    self.tokens.pop(tok)
+            bad = [k for k in self.names if k[0] == "=" and self._is_bonus_text(k[1:])]
+            for k in bad:
+                self.names.pop(k)
+            if n or bad:
+                self._ver += 1
+        return n + len(bad)
 
     def known(self):
         return sum(1 for k in self.names if k[0] not in "#="), len(self.tokens)
@@ -406,27 +443,38 @@ class FontReader:
         """Cut a value into characters (they always have a blank column between them)
         and recognise each one; None if any character is uncertain."""
         segs = _segments((pic > 0.35).any(0), 1)
-        if not segs:
+        chars = [self._read_piece(pic[:, a:b], gidx) for a, b in segs]
+        # a speck of the icon behind the tooltip can sit right next to the value; it's only
+        # dropped where the value format allows nothing: before the "+", after the "%",
+        # after a complete ",000" group - so a digit is never thrown away
+        while len(chars) > 1 and chars[0] is None and chars[1] == "+":
+            chars = chars[1:]
+        while len(chars) > 1 and chars[-1] is None and None not in chars[:-1] and \
+                re.search(r"(%|,\d{3})$", "".join(chars[:-1])):
+            chars = chars[:-1]
+        if not chars or None in chars:
+            return None
+        out = "".join(chars)
+        return out if VALUE_TOKEN.match(out) else None
+
+    def _read_piece(self, piece, gidx):
+        w = piece.shape[1]
+        ch = gidx.best(piece, GLYPH_TOL, speck=GLYPH_SPECK) if w <= 13 else None
+        if ch is not None:
+            return ch
+        # a faint speck can glue two characters together: cut this piece again on solid
+        # strokes only, keeping 1 px of soft edge
+        parts = _segments((piece > 0.7).any(0), 1)
+        if len(parts) < 1 or (len(parts) == 1 and parts[0] == (0, w)):
             return None
         out = ""
-        for a, b in segs:
-            ch = gidx.best(pic[:, a:b], GLYPH_TOL) if b - a <= 13 else None
-            if ch is None:
-                # a faint speck (icon behind the tooltip) can glue two characters together:
-                # cut this piece again on solid strokes only, keeping 1 px of soft edge
-                piece = pic[:, a:b]
-                parts = _segments((piece > 0.7).any(0), 1)
-                if len(parts) < 1 or (len(parts) == 1 and parts[0] == (0, b - a)):
-                    return None
-                ch = ""
-                for sa, sb in parts:
-                    sa, sb = max(0, sa - 1), min(b - a, sb + 1)
-                    c = gidx.best(piece[:, sa:sb], GLYPH_TOL)
-                    if c is None:
-                        return None
-                    ch += c
-            out += ch
-        return out if VALUE_TOKEN.match(out) else None
+        for sa, sb in parts:
+            sa, sb = max(0, sa - 1), min(w, sb + 1)
+            c = gidx.best(piece[:, sa:sb], GLYPH_TOL, speck=GLYPH_SPECK)
+            if c is None:
+                return None
+            out += c
+        return out
 
     def _read_value(self, pic):
         _, _, tidx, gidx = self._indexes()
@@ -477,6 +525,39 @@ class FontReader:
                 return None, None, ""   # impossible value = misread, let the teacher look
             text = f"{vtxt} {bonus}" if vfirst else f"{bonus} {vtxt}"
             return "bonus", (bonus, v), text
+        return self._prefix_match(img, nidx) if PREFIX_MATCH else (None, None, "")
+
+    def _prefix_match(self, img, nidx):
+        """Fallback when a speck spoils the word cut (glued between name and value, or sitting
+        in front of the name): match known name pictures against the start of the line and
+        read everything after the name as the value. Only accepted if that rest is a complete,
+        possible value - otherwise the teacher looks."""
+        segs = _segments((img > 0.35).any(0), 1)
+        starts = [0]
+        if len(segs) > 1 and segs[0][1] - segs[0][0] <= 3:
+            starts.append(segs[1][0])          # skip a tiny speck in front of the name
+        W = img.shape[1]
+        cand = {}
+        for w, (labels, stack) in nidx.by_w.items():
+            for s0 in starts:
+                if s0 + w + 6 > W:
+                    continue
+                for l, d in zip(labels, _batch_diff(img[:, s0:s0 + w], stack)):
+                    if d <= NAME_TOL and d < cand.get(l, (9,))[0]:
+                        cand[l] = (float(d), s0 + w)
+        _, _, _, gidx = self._indexes()
+        for bonus, (d, end) in sorted(cand.items(), key=lambda kv: -kv[1][1]):   # longest name first
+            rest = img[:, end:]
+            cols = np.flatnonzero((rest > 0.35).any(0))
+            if len(cols) == 0 or cols[0] > 8:
+                continue
+            vtxt = self._read_glyphs(rest[:, cols[0]:cols[-1] + 1], gidx)
+            if not vtxt:
+                continue
+            lo, hi = self.bonus_range(bonus)
+            v = _num(vtxt)
+            if lo <= v <= hi:
+                return "bonus", (bonus, v), f"{bonus} {vtxt}"
         return None, None, ""
 
     # ---- learning
@@ -521,7 +602,8 @@ class FontReader:
                     return None, None
                 with self.lock:
                     self._add(self.names, bonus, npic)
-                    self._add(self.tokens, vtok, vpic)
+                    if self._plausible_token(vtok, vpic):
+                        self._add(self.tokens, vtok, vpic)
                     segs = _segments((vpic > 0.35).any(0), 1)
                     if len(segs) == len(vtok):
                         for (a, b), ch in zip(segs, vtok):
@@ -536,6 +618,8 @@ class FontReader:
             bonus, value = found[0]
             lo, hi = self.bonus_range(bonus)
             return ("bonus", (bonus, value)) if lo <= value <= hi else (None, None)
+        if key[0] == "=" and self._is_bonus_text(key[1:]):
+            return None, None      # a bonus line the teacher misread: don't remember it as text
         with self.lock:
             self._add(self.names, key, img)
         return (key, None) if key[0] == "#" else ("text", key[1:])
