@@ -22,11 +22,13 @@ import queue
 import shutil
 import sys
 import re
+import secrets
 import unicodedata
+import webbrowser
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, simpledialog
+from tkinter import ttk, simpledialog, messagebox
 
 import customtkinter as ctk
 
@@ -34,8 +36,10 @@ import mss
 from PIL import Image, ImageChops, ImageStat
 import numpy as np
 
+import cloud
 import font_reader
 import grid_finder
+import updater
 
 MSS = getattr(mss, "MSS", None) or mss.mss
 
@@ -129,6 +133,8 @@ CONFIG_PATH = os.path.join(APP_DIR, "pet_art_config.json")
 DEBUG_DIR = os.path.join(APP_DIR, "debug_captures")
 FONT_PATH = os.path.join(APP_DIR, "font_memory.pkl")  # what the app has learned of the game font
 MODES = ["Ignore", "Want", "Must"]
+PRESET_COLORS = ["rainbow", "#34d399", "#fbbf24", "#22d3ee", "#f472b6", "#a78bfa", "#60a5fa", "#f87171",
+                 "#ffffff"]
 OCR_WORKERS = 3
 OCR_SCALES = (2.5, 3.0)  # each tooltip is read at these zooms and the results merged
 ARTS_PER_PET = 7  # every pet art has 7 bonuses; fewer read = OCR missed some
@@ -141,6 +147,16 @@ MUST_COL = "#f5b041"
 KEY_COLOR = "#010203"  # overlay transparency key
 
 VK_F6, VK_F7 = 0x75, 0x76
+
+
+def _mix(col, t):
+    """Blend a #rrggbb colour towards white by t (0..1)."""
+    r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(v + (255 - v) * t) for v in (r, g, b))
+
+
+def _swatch(col):
+    return "#ff6ad5" if col == "rainbow" else col
 
 
 # ================================================================ parsing
@@ -522,6 +538,7 @@ class Overlay:
         self.flash_slot = None
         self.state = ([], {}, False, False)
         self.pages = {}
+        self.colors = {}
         self._tick()
 
     def _tick(self):
@@ -542,9 +559,10 @@ class Overlay:
         r, g, b = colorsys.hsv_to_rgb(h % 1.0, 1.0, 1.0)
         return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
-    def set(self, grids, marks, show_grid, show_scanned, pages):
+    def set(self, grids, marks, show_grid, show_scanned, pages, colors=None):
         self.state = (grids, marks, show_grid, show_scanned)
         self.pages = pages
+        self.colors = colors or {}
         self.redraw()
 
     def flash(self, slot):
@@ -578,15 +596,21 @@ class Overlay:
             x0, y0, x1, y1 = slot_rect(grids[gi], r, c)
             x0, y0, x1, y1 = x0 - ox, y0 - oy, x1 - ox, y1 - oy
             if status == "good":
-                # animated rainbow: each side a different hue, colours run around the slot
+                # one ring per matched preset colour; "rainbow" = animated rainbow
+                cols = self.colors.get((gi, pg, r, c)) or ["rainbow"]
                 h = self.phase + (r * 0.07 + c * 0.05)
                 for k, pad in enumerate((5, 2, -1)):
                     a0, b0, a1, b1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
                     w = 4 if k < 2 else 2
-                    for side, (sx0, sy0, sx1, sy1) in enumerate(
-                            ((a0, b0, a1, b0), (a1, b0, a1, b1), (a1, b1, a0, b1), (a0, b1, a0, b0))):
-                        cv.create_line(sx0, sy0, sx1, sy1, width=w, capstyle="projecting",
-                                       fill=self._hue(h + side * 0.25 + k * 0.12))
+                    col = cols[k % len(cols)]
+                    if col == "rainbow":
+                        for side, (sx0, sy0, sx1, sy1) in enumerate(
+                                ((a0, b0, a1, b0), (a1, b0, a1, b1), (a1, b1, a0, b1), (a0, b1, a0, b0))):
+                            cv.create_line(sx0, sy0, sx1, sy1, width=w, capstyle="projecting",
+                                           fill=self._hue(h + side * 0.25 + k * 0.12))
+                    else:
+                        glow = col if (self.pulse or len(cols) > 1) else _mix(col, 0.45)
+                        cv.create_rectangle(a0, b0, a1, b1, outline=glow, width=w)
             elif status == "incomplete":
                 cv.create_line(x0 + 5, y0 + 5, x1 - 5, y1 - 5, fill="#ff2a2a", width=4)
                 cv.create_line(x1 - 5, y0 + 5, x0 + 5, y1 - 5, fill="#ff2a2a", width=4)
@@ -689,6 +713,17 @@ class App:
         self.pages = {}        # grid index -> open page (0 = I)
         self.icons = {}        # slot -> item icon when it was read (skip re-reading the same item)
         self.slot_arts = {}    # slot -> {bonus: value} gathered over hovers of the same item
+        self.slot_names = {}   # slot -> item name ("Brown Collar +0")
+        self.mark_colors = {}  # slot -> colours of the presets it matched
+        self.profiles = []     # my filter presets
+        self.official = []     # presets published by the app owner (downloaded)
+        self.official_on = {}  # official preset id -> on/off for me
+        self.current = None    # preset shown in the editor
+        self.net_q = queue.Queue()
+        self.owner_key = None
+        self.admin_key = cloud.load_key(os.path.join(APP_DIR, "admin.key"), create=False)
+        self.market_rows, self.market_mine, self.market_at = [], [], 0.0
+        self._last_official = 0.0
         self.rolls = self.goods = 0
         self.keys_prev = {VK_F6: False, VK_F7: False}
 
@@ -704,6 +739,9 @@ class App:
         self.show_scanned = tk.BooleanVar(value=True)
         self.only_good = tk.BooleanVar(value=False)
         self.on_top = tk.BooleanVar(value=False)
+        self.market_match = tk.BooleanVar(value=False)
+        self.seller = ""
+        self.contact = ""
 
         self._style()
         self._build()
@@ -717,6 +755,8 @@ class App:
             OcrWorker(self.ocr_q, self.result_q, self.reader).start()
 
         PageWatcher(self).start()
+        self._bg(self._fetch_official)
+        self._bg(self._check_update)
         root.protocol("WM_DELETE_WINDOW", self._close)
         root.after(30, self._poll)
 
@@ -760,7 +800,7 @@ class App:
         r.title("Pet Art Filter - Jintea")
         icon = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "app.ico")
         if os.path.exists(icon):   # CustomTkinter sets its own icon shortly after start
-            r.after(300, lambda: r.iconbitmap(icon))
+            r.after(300, lambda i=icon: r.iconbitmap(i))
         r.configure(fg_color=BG)
         r.geometry("1280x840")
         r.minsize(1100, 700)
@@ -781,14 +821,14 @@ class App:
         tb.pack(side="left", padx=12)
         ctk.CTkLabel(tb, text="Pet Art Filter", font=self.f(17, "bold"), text_color=FG,
                      height=22, anchor="w").pack(anchor="w")
-        ctk.CTkLabel(tb, text="Metin2  ·  Jintea", font=self.f(12), text_color=MUTED,
-                     height=16, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(tb, text=f"Metin2  ·  Jintea  ·  v{updater.APP_VERSION}", font=self.f(12),
+                     text_color=MUTED, height=16, anchor="w").pack(anchor="w")
 
         ctk.CTkLabel(side, text="MENU", font=self.f(11, "bold"), text_color=MUTED, anchor="w"
                      ).pack(fill="x", padx=26, pady=(0, 6))
         self.nav = {}
         for key, icon, label in (("scan", "◎", "Scanner"), ("filter", "☰", "Filter"),
-                                 ("setup", "⚙", "Setup")):
+                                 ("market", "◈", "Market"), ("setup", "⚙", "Setup")):
             b = ctk.CTkButton(side, text=f"{icon}    {label}", anchor="w", height=44, corner_radius=12,
                               fg_color="transparent", hover_color=CARD2, text_color=MUTED,
                               font=self.f(14, "bold"), command=lambda k=key: self._show_page(k))
@@ -797,6 +837,15 @@ class App:
 
         bottom = ctk.CTkFrame(side, fg_color="transparent")
         bottom.pack(side="bottom", fill="x", padx=14, pady=18)
+        # update banner (hidden until a newer version is found)
+        self.update_box = ctk.CTkFrame(bottom, fg_color="#1f1a3a", corner_radius=12, border_width=1,
+                                       border_color=ACCENT)
+        self.update_lbl = ctk.CTkLabel(self.update_box, text="", font=self.f(12, "bold"), text_color=FG,
+                                       wraplength=180, justify="left")
+        self.update_lbl.pack(fill="x", padx=12, pady=(10, 4))
+        self.update_btn = self._btn(self.update_box, "Install update", self._install_update, kind="accent",
+                                    height=30)
+        self.update_btn.pack(fill="x", padx=12, pady=(0, 10))
         self.scan_btn = ctk.CTkButton(bottom, text="▶   Start scanning", height=50, corner_radius=14,
                                       fg_color=ACCENT, hover_color=ACCENT_H, font=self.f(15, "bold"),
                                       command=self._toggle)
@@ -822,7 +871,7 @@ class App:
         main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=1)
         self.pages_ui = {"scan": self._build_scan(main), "filter": self._build_filter(main),
-                         "setup": self._build_setup(main)}
+                         "market": self._build_market(main), "setup": self._build_setup(main)}
         self._show_page("scan")
 
     def _show_page(self, key):
@@ -834,6 +883,8 @@ class App:
         for k, b in self.nav.items():
             on = k == key
             b.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED)
+        if key == "market" and time.time() - self.market_at > 60:
+            self._market_refresh()
 
     def _page_title(self, parent, title, subtitle):
         h = ctk.CTkFrame(parent, fg_color="transparent")
@@ -905,6 +956,8 @@ class App:
         ctk.CTkLabel(res.header, text="click a row to flash its slot in the game", font=self.f(12),
                      text_color=MUTED).pack(side="left", padx=12)
         self._btn(res.header, "Clear list", self._clear_hist, width=96, height=30).pack(side="right")
+        self._btn(res.header, "◈  Sell selected", self._sell_dialog, kind="accent", width=130,
+                  height=30).pack(side="right", padx=(0, 8))
         ctk.CTkSwitch(res.header, text="Only good", variable=self.only_good, progress_color=ACCENT,
                       font=self.f(12), text_color=FG).pack(side="right", padx=14)
         tf = ctk.CTkFrame(res, fg_color=CARD, corner_radius=0)
@@ -978,6 +1031,14 @@ class App:
                                     scrollbar_button_color=CARD2, scrollbar_button_hover_color=BORDER)
         self._page_title(pg, "Filter", "Pick the bonuses you want. Pet arts that match glow in the game.")
 
+        pc = self._card(pg, "Presets", "Each preset glows in its own colour – turn on as many as you like. "
+                        "★ = official preset from the app owner.")
+        pc.pack(fill="x", padx=28, pady=(0, 14))
+        self.preset_bar = ctk.CTkFrame(pc, fg_color="transparent")
+        self.preset_bar.pack(fill="x", padx=18, pady=(4, 4))
+        self.preset_tools = ctk.CTkFrame(pc, fg_color="transparent")
+        self.preset_tools.pack(fill="x", padx=18, pady=(4, 14))
+
         rc = self._card(pg)
         rc.pack(fill="x", padx=28, pady=(0, 18))
         row = ctk.CTkFrame(rc, fg_color="transparent")
@@ -1018,17 +1079,195 @@ class App:
         return pg
 
     def _bump_min(self, d):
+        self._ensure_editable()
         self.min_matches.set(max(0, min(7, self._int(self.min_matches, 1) + d)))
         self._filter_changed()
 
     def _set_mode(self, name, mode):
+        self._ensure_editable()
         self.vars[name][0].set(mode)
         self._filter_changed()
 
     def _filter_changed(self):
+        self._editor_to_profile()
         self._save()
         self._render_selected()
         self._render_chips()
+        self._render_presets()
+        self._recheck()
+
+    # ------------------------------------------------------------ presets
+    def _new_id(self):
+        return secrets.token_hex(4)
+
+    def _all_profiles(self):
+        out = [dict(p, official=False) for p in self.profiles]
+        for o in self.official:
+            d = o.get("data") or {}
+            out.append({"id": "o:" + o["id"], "name": o.get("name", "Official"), "color": o.get("color", "rainbow"),
+                        "on": self.official_on.get(o["id"], True), "min": d.get("min", 1),
+                        "bonuses": d.get("bonuses", {}), "official": True})
+        return out
+
+    def _find_profile(self, pid):
+        return next((p for p in self._all_profiles() if p["id"] == pid), None)
+
+    def _own(self, pid):
+        return next((p for p in self.profiles if p["id"] == pid), None)
+
+    def _editor_to_profile(self):
+        p = self._own(self.current)
+        if p is None:
+            return
+        p["min"] = self._int(self.min_matches, 1)
+        p["bonuses"] = {n: {"mode": m.get(), "min": self._int(v, BONUSES[n][0])}
+                        for n, (m, v) in self.vars.items() if m.get() != "Ignore"}
+
+    def _profile_to_editor(self, p):
+        self.min_matches.set(p.get("min", 1))
+        for n, (m, v) in self.vars.items():
+            d = (p.get("bonuses") or {}).get(n)
+            m.set(d.get("mode", "Want") if d else "Ignore")
+            v.set(d.get("min", BONUSES[n][0]) if d else BONUSES[n][0])
+
+    def _select_profile(self, pid):
+        self._editor_to_profile()
+        p = self._find_profile(pid)
+        if p is None:
+            return
+        self.current = pid
+        self._profile_to_editor(p)
+        self._save()
+        self._render_presets()
+        self._render_selected()
+        self._render_chips()
+
+    def _ensure_editable(self):
+        """Editing an official preset makes your own copy of it (and turns the official one off)."""
+        p = self._find_profile(self.current)
+        if p is None or not p["official"]:
+            return
+        copy = {"id": self._new_id(), "name": p["name"] + " (mine)", "color": p["color"], "on": True,
+                "min": p.get("min", 1), "bonuses": json.loads(json.dumps(p.get("bonuses", {})))}
+        self.profiles.append(copy)
+        self.official_on[p["id"][2:]] = False
+        self.current = copy["id"]
+        self._set_status("You changed an official preset, so it was copied to your own presets.", ACCENT)
+
+    def _toggle_profile(self, pid):
+        if pid.startswith("o:"):
+            self.official_on[pid[2:]] = not self.official_on.get(pid[2:], True)
+        else:
+            p = self._own(pid)
+            p["on"] = not p.get("on", True)
+        self._save()
+        self._render_presets()
+        self._recheck()
+
+    def _set_profile_color(self, col):
+        self._ensure_editable()
+        p = self._own(self.current)
+        if p:
+            p["color"] = col
+        self._filter_changed()
+
+    def _new_profile(self):
+        used = {p.get("color") for p in self.profiles}
+        col = next((c for c in PRESET_COLORS if c not in used), "rainbow")
+        p = {"id": self._new_id(), "name": f"Preset {len(self.profiles) + 1}", "color": col, "on": True,
+             "min": 1, "bonuses": {}}
+        self.profiles.append(p)
+        self._select_profile(p["id"])
+
+    def _dup_profile(self):
+        p = self._find_profile(self.current)
+        if not p:
+            return
+        self._editor_to_profile()
+        copy = {"id": self._new_id(), "name": p["name"] + " copy", "color": p["color"], "on": True,
+                "min": p.get("min", 1), "bonuses": json.loads(json.dumps(p.get("bonuses", {})))}
+        self.profiles.append(copy)
+        self._select_profile(copy["id"])
+
+    def _rename_profile(self):
+        self._ensure_editable()
+        p = self._own(self.current)
+        if not p:
+            return
+        name = simpledialog.askstring("Rename preset", "Name:", initialvalue=p["name"], parent=self.root)
+        if name and name.strip():
+            p["name"] = name.strip()[:40]
+            self._filter_changed()
+
+    def _delete_profile(self):
+        p = self._own(self.current)
+        if not p:
+            return
+        if not messagebox.askyesno("Delete preset", f"Delete the preset “{p['name']}”?", parent=self.root):
+            return
+        self.profiles.remove(p)
+        if not self.profiles:
+            self.profiles.append({"id": self._new_id(), "name": "My filter", "color": "rainbow", "on": True,
+                                  "min": 1, "bonuses": {}})
+        self.current = None
+        self._select_profile(self.profiles[0]["id"])
+        self._recheck()
+
+    def _render_presets(self):
+        bar, tools = self.preset_bar, self.preset_tools
+        for w in bar.winfo_children() + tools.winfo_children():
+            w.destroy()
+        allp = self._all_profiles()
+        for i, p in enumerate(allp):
+            sel = p["id"] == self.current
+            on = p.get("on", True)
+            pill = ctk.CTkFrame(bar, fg_color=CARD2 if sel else CARD, corner_radius=16,
+                                border_width=2 if sel else 1, border_color=ACCENT if sel else BORDER)
+            pill.grid(row=i // 4, column=i % 4, sticky="w", padx=3, pady=3)
+            ctk.CTkButton(pill, text="●" if on else "○", width=26, height=26, corner_radius=13,
+                          fg_color="transparent", hover_color=BORDER, text_color=_swatch(p["color"]),
+                          font=self.f(16), command=lambda pid=p["id"]: self._toggle_profile(pid)
+                          ).pack(side="left", padx=(4, 0), pady=2)
+            ctk.CTkButton(pill, text=("★ " if p["official"] else "") + p["name"], height=26,
+                          fg_color="transparent", hover_color=BORDER, text_color=FG if on else MUTED,
+                          font=self.f(12, "bold" if sel else "normal"), width=40,
+                          command=lambda pid=p["id"]: self._select_profile(pid)).pack(side="left", padx=(0, 8))
+        cur = self._find_profile(self.current)
+        if not cur:
+            return
+        ctk.CTkLabel(tools, text="Colour", font=self.f(12), text_color=MUTED).pack(side="left", padx=(0, 6))
+        for col in PRESET_COLORS:
+            mine = cur["color"] == col
+            ctk.CTkButton(tools, text="R" if col == "rainbow" else "", width=24, height=24, corner_radius=12,
+                          fg_color=_swatch(col), hover_color=_swatch(col), text_color="white",
+                          border_width=2 if mine else 0, border_color="#ffffff", font=self.f(10, "bold"),
+                          command=lambda c=col: self._set_profile_color(c)).pack(side="left", padx=2)
+        self._btn(tools, "+ New", self._new_profile, width=70, height=28).pack(side="left", padx=(14, 4))
+        self._btn(tools, "Duplicate", self._dup_profile, width=84, height=28).pack(side="left", padx=4)
+        if not cur["official"]:
+            self._btn(tools, "Rename", self._rename_profile, width=74, height=28).pack(side="left", padx=4)
+            self._btn(tools, "Delete", self._delete_profile, kind="danger", width=70, height=28).pack(side="left", padx=4)
+        if self.admin_key and cloud.configured():
+            if cur["official"]:
+                self._btn(tools, "★ Unpublish", self._admin_unpublish, kind="danger", width=100,
+                          height=28).pack(side="right")
+            else:
+                self._btn(tools, "★ Publish to all players", self._admin_publish, kind="ghost", width=170,
+                          height=28).pack(side="right")
+
+    def _profile_matches(self, p, found):
+        present = dict(found)
+        want = p.get("bonuses") or {}
+        if not want:
+            return False
+        for n, d in want.items():
+            if d.get("mode") == "Must" and present.get(n, -1) < d.get("min", 0):
+                return False
+        hits = sum(1 for n, d in want.items() if present.get(n, -1) >= d.get("min", 0))
+        return hits >= p.get("min", 1)
+
+    def _match_all(self, found):
+        return [p for p in self._all_profiles() if p.get("on", True) and self._profile_matches(p, found)]
 
     def _render_selected(self):
         f = self.sel_frame
@@ -1084,6 +1323,7 @@ class App:
             val.pack(side="left")
 
             def moved(v, var=mn, lbl=val, st=step, lo_=lo):
+                self._ensure_editable()
                 iv = int(round((v - lo_) / st) * st + lo_)
                 var.set(iv)
                 lbl.configure(text=f"≥ {iv}")
@@ -1093,7 +1333,7 @@ class App:
                                fg_color=CARD2, height=16, command=moved)
             sl.set(mn.get())
             sl.pack(side="left", fill="x", expand=True, padx=8)
-            sl.bind("<ButtonRelease-1>", lambda e: self._save())
+            sl.bind("<ButtonRelease-1>", lambda e: self._filter_changed())
             ctk.CTkLabel(bot, text=f"max {hi}", font=self.f(12), text_color=MUTED).pack(side="left")
 
     def _chip_style(self, chip, name):
@@ -1138,6 +1378,306 @@ class App:
                 chip.grid(row=i // 3, column=i % 3, sticky="ew", padx=3, pady=3)
                 self._chip_style(chip, name)
                 self.chips[name] = chip
+
+    # ------------------------------------------------------------ market page
+    def _build_market(self, parent):
+        pg = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        self._page_title(pg, "Market", "Buy and sell pet arts with other players. Prices in KK "
+                         "(1 KK = 1,000,000 Yang). Whisper the seller in game to trade.")
+        bar = ctk.CTkFrame(pg, fg_color="transparent")
+        bar.pack(fill="x", padx=28, pady=(0, 8))
+        seg = dict(height=32, font=self.f(12, "bold"), selected_color=ACCENT, selected_hover_color=ACCENT_H,
+                   unselected_color=CARD2, unselected_hover_color=BORDER, fg_color=CARD2, text_color=FG)
+        self.market_view = ctk.CTkSegmentedButton(bar, values=["All listings", "My listings"],
+                                                  command=lambda v: self._market_refresh(), **seg)
+        self.market_view.set("All listings")
+        self.market_view.pack(side="left")
+        self.market_sort = ctk.CTkSegmentedButton(bar, values=["Newest", "Cheapest", "Priciest"],
+                                                  command=lambda v: self._render_market(), **seg)
+        self.market_sort.set("Newest")
+        self.market_sort.pack(side="left", padx=12)
+        ctk.CTkSwitch(bar, text="Matches my presets", variable=self.market_match, progress_color=ACCENT,
+                      font=self.f(12), text_color=FG, command=self._render_market).pack(side="left", padx=8)
+        self._btn(bar, "↻  Refresh", self._market_refresh, width=100, height=32).pack(side="right")
+        self.market_search = ctk.CTkEntry(pg, placeholder_text="🔍  Search item, bonus or seller…",
+                                          height=38, corner_radius=12, fg_color=CARD, border_color=BORDER,
+                                          text_color=FG, font=self.f(13))
+        self.market_search.pack(fill="x", padx=28, pady=(0, 6))
+        self.market_search.bind("<KeyRelease>", lambda e: self._render_market())
+        self.market_info = ctk.CTkLabel(pg, text="", font=self.f(12), text_color=MUTED, anchor="w")
+        self.market_info.pack(fill="x", padx=30)
+        self.market_list = ctk.CTkScrollableFrame(pg, fg_color=BG, corner_radius=0,
+                                                  scrollbar_button_color=CARD2, scrollbar_button_hover_color=BORDER)
+        self.market_list.pack(fill="both", expand=True, padx=20, pady=(4, 20))
+        return pg
+
+    def _market_refresh(self):
+        if not cloud.configured():
+            self.market_info.configure(text="The market isn’t online yet – it will switch on with an "
+                                            "app update.", text_color=WARN)
+            return
+        self.market_info.configure(text="Loading…", text_color=MUTED)
+        mine = self.market_view.get() == "My listings"
+        if mine:
+            key = self._owner()
+            self._bg(lambda: self.net_q.put(("mine", cloud.my_listings(key))))
+        else:
+            self._bg(lambda: self.net_q.put(("market", cloud.market())))
+
+    def _owner(self):
+        if not self.owner_key:
+            self.owner_key = cloud.load_key(os.path.join(APP_DIR, "market_owner.key"))
+        return self.owner_key
+
+    @staticmethod
+    def _age(ts):
+        try:
+            import datetime
+            t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            sec = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+        except Exception:
+            return ""
+        if sec < 3600:
+            return f"{max(1, int(sec // 60))} min ago"
+        if sec < 86400:
+            return f"{int(sec // 3600)} h ago"
+        return f"{int(sec // 86400)} d ago"
+
+    def _render_market(self):
+        mine = self.market_view.get() == "My listings"
+        rows = list(self.market_mine if mine else self.market_rows)
+        q = self.market_search.get().strip().lower()
+        if q:
+            rows = [r for r in rows if q in (r.get("item", "") + " " + r.get("seller", "") + " " +
+                                             " ".join(str(b[0]) for b in r.get("bonuses") or [])).lower()]
+        if self.market_match.get():
+            rows = [r for r in rows if self._match_all([(b[0], b[1]) for b in r.get("bonuses") or []])]
+        order = self.market_sort.get()
+        if order == "Cheapest":
+            rows.sort(key=lambda r: float(r.get("price_kk") or 0))
+        elif order == "Priciest":
+            rows.sort(key=lambda r: -float(r.get("price_kk") or 0))
+        for w in self.market_list.winfo_children():
+            w.destroy()
+        self.market_info.configure(text=f"{len(rows)} listing{'s' if len(rows) != 1 else ''}"
+                                        + ("  ·  showing the first 80" if len(rows) > 80 else ""),
+                                   text_color=MUTED)
+        wanted = {n for p in self._all_profiles() if p.get("on", True) for n in (p.get("bonuses") or {})}
+        for r in rows[:80]:
+            card = ctk.CTkFrame(self.market_list, fg_color=CARD, corner_radius=14, border_width=1,
+                                border_color=BORDER)
+            card.pack(fill="x", padx=8, pady=5)
+            card.grid_columnconfigure(1, weight=1)
+            left = ctk.CTkFrame(card, fg_color="transparent")
+            left.grid(row=0, column=0, sticky="nw", padx=16, pady=12)
+            ctk.CTkLabel(left, text=r.get("item", "?"), font=self.f(15, "bold"), text_color=MUST_COL,
+                         anchor="w").pack(anchor="w")
+            who = f"{r.get('seller', '?')}  ·  {self._age(r.get('created_at', ''))}"
+            if mine and r.get("status") == "sold":
+                who += "  ·  SOLD"
+            ctk.CTkLabel(left, text=who, font=self.f(12), text_color=MUTED, anchor="w").pack(anchor="w")
+            if r.get("contact"):
+                ctk.CTkLabel(left, text=r["contact"], font=self.f(11), text_color=MUTED, anchor="w",
+                             wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
+            mid = ctk.CTkFrame(card, fg_color="transparent")
+            mid.grid(row=0, column=1, sticky="nw", pady=12)
+            for i, b in enumerate(r.get("bonuses") or []):
+                hit = b[0] in wanted
+                ctk.CTkLabel(mid, text=f"{b[0]}  {b[1]}", font=self.f(12, "bold" if hit else "normal"),
+                             text_color=ACCENT if hit else FG, anchor="w", height=18
+                             ).grid(row=i % 4, column=i // 4, sticky="w", padx=(0, 22))
+            right = ctk.CTkFrame(card, fg_color="transparent")
+            right.grid(row=0, column=2, sticky="ne", padx=16, pady=12)
+            ctk.CTkLabel(right, text=f"{float(r.get('price_kk') or 0):g} KK", font=self.f(22, "bold"),
+                         text_color=GOOD).pack(anchor="e")
+            if mine:
+                row = ctk.CTkFrame(right, fg_color="transparent")
+                row.pack(anchor="e", pady=(6, 0))
+                if r.get("status") != "sold":
+                    self._btn(row, "Sold", lambda i=r["id"]: self._market_action("sold", i), width=60,
+                              height=28).pack(side="left", padx=3)
+                self._btn(row, "Remove", lambda i=r["id"]: self._market_action("remove", i), kind="danger",
+                          width=70, height=28).pack(side="left", padx=3)
+            else:
+                self._btn(right, "Copy name", lambda n=r.get("seller", ""): self._copy(n), width=100,
+                          height=28).pack(anchor="e", pady=(6, 0))
+        if not rows:
+            ctk.CTkLabel(self.market_list, text="Nothing here yet.", font=self.f(13), text_color=MUTED).pack(pady=30)
+
+    def _copy(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._set_status(f"Copied “{text}” – whisper them in game.", GOOD)
+
+    def _market_action(self, what, listing_id):
+        key = self._owner()
+        fn = cloud.mark_sold if what == "sold" else cloud.remove_listing
+
+        def job():
+            fn(key, listing_id)
+            self.net_q.put(("mine", cloud.my_listings(key)))
+            self.net_q.put(("msg", ("Marked as sold." if what == "sold" else "Listing removed.", GOOD)))
+        self._bg(job)
+
+    def _sell_dialog(self):
+        sel = self.hist.selection()
+        slot = self.hist_slots.get(sel[0]) if sel else None
+        if slot is None:
+            self._set_status("Select a pet art in the Results list first.", WARN)
+            return
+        arts = list((self.slot_arts.get(slot) or {}).items())
+        if len(arts) < ARTS_PER_PET:
+            self._set_status("That pet art wasn’t read completely – hover it again first.", WARN)
+            return
+        if not cloud.configured():
+            self._set_status("The market isn’t online yet.", WARN)
+            return
+        item = self.slot_names.get(slot) or "Pet art"
+        win = ctk.CTkToplevel(self.root)
+        win.title("Sell on market")
+        win.configure(fg_color=BG)
+        win.geometry("460x520")
+        win.transient(self.root)
+        win.grab_set()
+        ctk.CTkLabel(win, text="Sell on market", font=self.f(20, "bold"), text_color=FG).pack(anchor="w", padx=22,
+                                                                                               pady=(18, 2))
+        ctk.CTkLabel(win, text=item, font=self.f(15, "bold"), text_color=MUST_COL).pack(anchor="w", padx=22)
+        box = ctk.CTkFrame(win, fg_color=CARD, corner_radius=12)
+        box.pack(fill="x", padx=22, pady=10)
+        for b, v in arts:
+            ctk.CTkLabel(box, text=f"{b}   {v}", font=self.f(12), text_color=FG, anchor="w", height=20
+                         ).pack(anchor="w", padx=14)
+        entries = {}
+        for key, label, val in (("price", "Price in KK", ""), ("seller", "Your character name", self.seller),
+                                ("contact", "Note / contact (optional)", self.contact)):
+            ctk.CTkLabel(win, text=label, font=self.f(12), text_color=MUTED).pack(anchor="w", padx=22)
+            e = ctk.CTkEntry(win, height=34, corner_radius=10, fg_color=CARD, border_color=BORDER, text_color=FG)
+            e.insert(0, val)
+            e.pack(fill="x", padx=22, pady=(0, 8))
+            entries[key] = e
+
+        def submit():
+            try:
+                price = float(entries["price"].get().replace(",", ".").lower().replace("kk", "").strip())
+                assert price > 0
+            except Exception:
+                messagebox.showwarning("Price", "Enter the price in KK, e.g. 150 or 2.5", parent=win)
+                return
+            seller = entries["seller"].get().strip()
+            if len(seller) < 2:
+                messagebox.showwarning("Name", "Enter your character name so buyers can whisper you.", parent=win)
+                return
+            self.seller, self.contact = seller, entries["contact"].get().strip()[:80]
+            self._save()
+            key, contact = self._owner(), self.contact
+
+            def job():
+                cloud.add_listing(key, seller, contact, item, arts, price, updater.APP_VERSION)
+                self.net_q.put(("msg", (f"Listed {item} for {price:g} KK on the market.", GOOD)))
+                self.market_at = 0.0
+            self._bg(job)
+            win.destroy()
+
+        self._btn(win, "◈  List it", submit, kind="accent", height=40).pack(fill="x", padx=22, pady=(6, 18))
+
+    # ------------------------------------------------------------ online helpers
+    def _bg(self, fn):
+        def run():
+            try:
+                fn()
+            except cloud.CloudError as e:
+                self.net_q.put(("msg", (str(e), BAD)))
+            except Exception as e:
+                self.net_q.put(("msg", (f"{type(e).__name__}: {e}", BAD)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _fetch_official(self):
+        self._last_official = time.time()
+        if cloud.configured():
+            self.net_q.put(("official", cloud.official_presets()))
+
+    def _check_update(self):
+        info = updater.check_latest()
+        if info and updater.is_newer(info["version"]):
+            self.net_q.put(("update", info))
+
+    def _install_update(self):
+        info = getattr(self, "update_info", None)
+        if not info:
+            return
+        if not updater.can_self_update():
+            webbrowser.open(f"https://github.com/{updater.UPDATE_REPO}/releases/latest")
+            return
+        self.update_btn.configure(state="disabled", text="Downloading…")
+
+        def job():
+            updater.download_and_install(info, lambda f: self.net_q.put(
+                ("progress", f"Downloading update… {int(f * 100)}%")))
+            self.net_q.put(("restart", None))
+        self._bg(job)
+
+    def _admin_publish(self):
+        p = self._own(self.current)
+        if not p or not self.admin_key:
+            return
+        if not messagebox.askyesno("Publish preset", f"Publish “{p['name']}” to every player?",
+                                   parent=self.root):
+            return
+        self._editor_to_profile()
+        key, data = self.admin_key, {"min": p.get("min", 1), "bonuses": p.get("bonuses", {})}
+
+        def job():
+            cloud.publish_preset(key, p["name"], p["color"], data)
+            self.net_q.put(("official", cloud.official_presets()))
+            self.net_q.put(("msg", (f"Published “{p['name']}” to all players.", GOOD)))
+        self._bg(job)
+
+    def _admin_unpublish(self):
+        p = self._find_profile(self.current)
+        if not p or not p["official"] or not self.admin_key:
+            return
+        if not messagebox.askyesno("Unpublish", f"Remove the official preset “{p['name']}” for everyone?",
+                                   parent=self.root):
+            return
+        key, pid = self.admin_key, p["id"][2:]
+
+        def job():
+            cloud.delete_preset(key, pid)
+            self.net_q.put(("official", cloud.official_presets()))
+            self.net_q.put(("msg", ("Official preset removed.", GOOD)))
+        self._bg(job)
+
+    def _handle_net(self):
+        while True:
+            try:
+                kind, data = self.net_q.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "msg":
+                self._set_status(*data)
+            elif kind == "progress":
+                self._set_status(data, ACCENT)
+            elif kind == "official":
+                self.official = data or []
+                if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
+                    self.current = self.profiles[0]["id"]
+                    self._profile_to_editor(self.profiles[0])
+                self._save()
+                self._render_presets()
+                self._recheck()
+            elif kind == "update":
+                self.update_info = data
+                self.update_lbl.configure(text=f"⬆  Version {data['version']} is available")
+                self.update_box.pack(fill="x", pady=(0, 12), before=self.scan_btn)
+            elif kind == "restart":
+                self._close()
+            elif kind in ("market", "mine"):
+                if kind == "market":
+                    self.market_rows = data or []
+                else:
+                    self.market_mine = data or []
+                self.market_at = time.time()
+                self._render_market()
 
     # ------------------------------------------------------------ setup page
     def _build_setup(self, parent):
@@ -1217,6 +1757,12 @@ class App:
         self.learn_lbl = ctk.CTkLabel(lc, text="", font=self.f(13), text_color=FG, anchor="w", justify="left")
         self.learn_lbl.pack(fill="x", padx=18, pady=(4, 16))
 
+        if self.admin_key:
+            ad = self._card(pg, "★ Admin", "This PC has the admin key. On the Filter page, select one of your "
+                            "presets and click “Publish to all players” – it appears as an official "
+                            "★ preset in everyone’s app within a few minutes. Keep admin.key private.")
+            ad.pack(fill="x", padx=28, pady=(0, 16))
+
         note = self._card(pg)
         note.pack(fill="x", padx=28, pady=(0, 28))
         ctk.CTkLabel(note, text="ⓘ  Run the game in windowed or borderless-windowed mode so the glow can be "
@@ -1240,12 +1786,29 @@ class App:
             if key in cfg:
                 var.set(cfg[key])
         self.grids = cfg.get("grids", [])
+        self.official = cfg.get("official_cache", [])
+        self.official_on = cfg.get("official_on", {})
+        self.seller, self.contact = cfg.get("seller", ""), cfg.get("contact", "")
+        self.profiles = cfg.get("profiles") or []
+        if not self.profiles:   # first start with presets: turn the old single filter into one
+            old = {}
+            for name, d in cfg.get("bonuses", {}).items():
+                name = {"Chance of piercing Hits": "Chance for piercing Hits"}.get(name, name)
+                if name in BONUSES and d.get("mode", "Ignore") != "Ignore":
+                    old[name] = {"mode": d["mode"], "min": d.get("min", BONUSES[name][0])}
+            self.profiles = [{"id": self._new_id(), "name": "My filter", "color": "rainbow", "on": True,
+                              "min": cfg.get("min_matches", 1), "bonuses": old}]
+        self.current = cfg.get("current")
+        if not self._find_profile(self.current):
+            self.current = self.profiles[0]["id"]
+        self._profile_to_editor(self._find_profile(self.current))
         for sl, var, lbl, unit in getattr(self, "setup_sliders", []):
             sl.set(var.get())
             lbl.configure(text=f"{var.get()} {unit}")
         self._refresh_grid_list()
         self._render_selected()
         self._render_chips()
+        self._render_presets()
 
     def _settings(self):
         return {"min_matches": self.min_matches, "delay_ms": self.delay_ms,
@@ -1263,6 +1826,11 @@ class App:
         cfg["grids"] = self.grids
         cfg["bonuses"] = {n: {"mode": m.get(), "min": self._int(v, BONUSES[n][0])}
                           for n, (m, v) in self.vars.items()}
+        cfg["profiles"] = self.profiles
+        cfg["current"] = self.current
+        cfg["official_on"] = self.official_on
+        cfg["official_cache"] = self.official
+        cfg["seller"], cfg["contact"] = self.seller, self.contact
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
@@ -1277,6 +1845,7 @@ class App:
             return default
 
     def _reset(self):
+        self._ensure_editable()
         for m, _ in self.vars.values():
             m.set("Ignore")
         self._filter_changed()
@@ -1453,7 +2022,7 @@ class App:
     def _refresh_overlay(self):
         if hasattr(self, "overlay"):
             self.overlay.set(self.grids, self.marks, self.show_grid.get(), self.show_scanned.get(),
-                             self.pages)
+                             self.pages, self.mark_colors)
 
     # ------------------------------------------------------------ scanning
     def _toggle(self):
@@ -1484,6 +2053,8 @@ class App:
         self.seq_sig.clear()
         self.icons.clear()
         self.slot_arts.clear()
+        self.slot_names.clear()
+        self.mark_colors.clear()
         self._refresh_overlay()
         if hasattr(self, "tiles"):
             self._update_stats()
@@ -1560,6 +2131,9 @@ class App:
                 changed = True
         if changed:
             self._refresh_overlay()
+        self._handle_net()
+        if time.time() - self._last_official > 600:   # official presets: check every 10 minutes
+            self._bg(self._fetch_official)
         self._tick = getattr(self, "_tick", 0) + 1
         if self._tick % 10 == 0:   # ~3x a second is plenty for the status texts
             pending = self.ocr_q.qsize()
@@ -1606,10 +2180,19 @@ class App:
                   "#petart": "[Pet Artifact]", "#wearable": "[Wearable]", "?": "✖ unreadable line"}
         self.raw.delete("1.0", "end")
         self.raw.insert("end", "\n".join(pretty.get(l, l) for l in lines))
-        good, rows = self.evaluate(found)
+        if name:
+            self.slot_names[slot] = name
+        name = self.slot_names.get(slot, name)
+        _, rows = self.evaluate(found)
+        matched = self._match_all(found)
+        good = bool(matched)
         complete = len(found) >= ARTS_PER_PET
         if complete:
             self.marks[slot] = "good" if good else "bad"
+            if good:
+                self.mark_colors[slot] = [p["color"] for p in matched][:3]
+            else:
+                self.mark_colors.pop(slot, None)
         else:
             # some bonuses weren't read: don't trust it, red X, read it again next hover
             good = False
@@ -1618,8 +2201,9 @@ class App:
         self._show_current(name, rows)
         where = self._slot_name(slot)
         if complete:
+            tags = ", ".join(p["name"] for p in matched)
             self._set_verdict("✦  Good pet art" if good else "Not good", GOOD if good else BAD,
-                              f"{name}  ·  {where}")
+                              (f"{tags}  ·  " if tags else "") + f"{name}  ·  {where}")
         else:
             self._set_verdict(f"Incomplete  {len(found)}/{ARTS_PER_PET}", WARN,
                               f"{name}  ·  {where}  ·  hover it again")
@@ -1630,7 +2214,8 @@ class App:
                 self.hist.delete(iid)
                 del self.hist_slots[iid]
         if good or not self.only_good.get():
-            result = ("GOOD" if good else "no") if complete else f"X {len(found)}/{ARTS_PER_PET}"
+            result = (("GOOD · " + ", ".join(p["name"] for p in matched)) if good else "no") \
+                if complete else f"X {len(found)}/{ARTS_PER_PET}"
             tag = ("good" if good else "bad") if complete else "incomplete"
             iid = self.hist.insert("", 0, values=(self._slot_name(slot), name, result,
                                                   ",  ".join(f"{b} {v}" for b, v in found)),
@@ -1647,13 +2232,22 @@ class App:
         for seq in sorted(self.seq_sig):
             slot, sig = self.seq_sig[seq]
             latest[slot] = sig
-        for slot, sig in latest.items():
-            if sig and self.marks.get(slot) in ("good", "bad"):
-                good, _ = self.evaluate(list(sig))
-                self.marks[slot] = "good" if good else "bad"
+        names = {}
+        for slot in set(latest) | set(self.slot_arts):
+            arts = list((self.slot_arts.get(slot) or {}).items()) or list(latest.get(slot) or [])
+            if arts and self.marks.get(slot) in ("good", "bad"):
+                matched = self._match_all(arts)
+                self.marks[slot] = "good" if matched else "bad"
+                names[slot] = ", ".join(p["name"] for p in matched)
+                if matched:
+                    self.mark_colors[slot] = [p["color"] for p in matched][:3]
+                else:
+                    self.mark_colors.pop(slot, None)
         for iid, slot in self.hist_slots.items():
+            if self.marks.get(slot) not in ("good", "bad"):
+                continue
             good = self.marks.get(slot) == "good"
-            self.hist.set(iid, "v", "GOOD" if good else "no")
+            self.hist.set(iid, "v", ("GOOD · " + names.get(slot, "")) if good else "no")
             self.hist.item(iid, tags=("good" if good else "bad",))
         self._update_stats()
         self._refresh_overlay()
