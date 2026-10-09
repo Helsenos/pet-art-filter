@@ -145,6 +145,20 @@ DATA_DIR = os.path.join(APP_DIR, "dataset")      # small tooltip cut-outs for me
 DATA_MAX = 1500
 FONT_PATH = os.path.join(APP_DIR, "font_memory.pkl")  # what the app has learned of the game font
 MODES = ["Ignore", "Want", "Must"]
+# every pet art type in the game (item names are matched to these)
+PET_TYPES = ["Candy", "Pet Perfume", "Silver Leash", "Ring of Love", "Ring of Harmony", "Blue Ball",
+             "Red Collar", "Brown Collar", "Silver Ring", "Gold Ring", "Poison Vial", "Thunder Spike",
+             "Hellfire Relic", "Charta Obscura", "Mark of Merlin", "Steel Collar"]
+
+
+def pet_name(text):
+    """'Sllver Ring +0' -> 'Silver Ring +0': the read item name matched to the real pet art types."""
+    m = re.match(r"\s*(.*?)[\s,.]*\+\s*(\d{1,2})\s*$", text or "")
+    base, plus = (m.group(1), m.group(2)) if m else ((text or "").strip(), None)
+    hit = difflib.get_close_matches(base.title(), PET_TYPES, n=1, cutoff=0.6)
+    if not hit:
+        return (text or "").strip()
+    return f"{hit[0]} +{plus}" if plus is not None else hit[0]
 PRESET_COLORS = ["rainbow", "#34d399", "#fbbf24", "#22d3ee", "#f472b6", "#a78bfa", "#60a5fa", "#f87171",
                  "#ffffff"]
 OCR_WORKERS = 3
@@ -635,7 +649,7 @@ class Scanner(threading.Thread):
                     old = self.icons.get(cur)
                     same_item = old is not None and old.size == icon.size and \
                         sum(ImageStat.Stat(ImageChops.difference(old, icon)).mean) / 3 < 8
-                    if same_item and self.marks.get(cur) in ("good", "bad"):
+                    if same_item and self.marks.get(cur) in ("good", "bad", "other"):
                         if hide:
                             self._show_overlay()
                         time.sleep(0.004)
@@ -660,16 +674,18 @@ class Scanner(threading.Thread):
 class OcrWorker(threading.Thread):
     """Reads tooltips with the learned game font (font_reader)."""
 
-    def __init__(self, ocr_q, result_q, reader):
+    def __init__(self, ocr_q, result_q, reader, careful=lambda: False):
         super().__init__(daemon=True)
         self.ocr_q, self.result_q, self.reader = ocr_q, result_q, reader
+        self.careful = careful      # use the slow careful reader for unclear lines?
 
     def run(self):
         while True:
             seq, slot, img, cx, same_item, y_from = self.ocr_q.get()
             try:
                 t = time.perf_counter()
-                name, arts, debug, box = self.reader.read(np.asarray(img), cx, want_box=True, y_from=y_from)
+                name, arts, debug, box = self.reader.read(np.asarray(img), cx, teach=self.careful(),
+                                                          want_box=True, y_from=y_from)
                 ms = (time.perf_counter() - t) * 1000
                 self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
                 if len(arts) >= ARTS_PER_PET and box:      # after the result: the glow never waits for this
@@ -1266,6 +1282,8 @@ class App:
         self.on_top = tk.BooleanVar(value=False)
         self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
         self.anim_on = tk.BooleanVar(value=True)      # page fade + sliding menu marker
+        self.careful_on = tk.BooleanVar(value=False)  # slow careful reader for unclear lines (off: fast only)
+        self._careful = False
         self.minibar_on = tk.BooleanVar(value=True)   # small bar on the game screen
         self.minibar_pos = None
         self.market_match = tk.BooleanVar(value=False)
@@ -1281,6 +1299,7 @@ class App:
         self.minibar = MiniBar(self)
         self.game_layer = GameLayer(self._game_exe)
         self._apply_style()
+        self._careful = bool(self.careful_on.get())
         self._cover = None
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
@@ -1290,7 +1309,7 @@ class App:
         self.reader = font_reader.FontReader(
             FONT_PATH, lambda t: parse_lines([fix_ocr(t)]), lambda b: tuple(BONUSES[b]))
         for _ in range(OCR_WORKERS):
-            OcrWorker(self.ocr_q, self.result_q, self.reader).start()
+            OcrWorker(self.ocr_q, self.result_q, self.reader, careful=lambda: self._careful).start()
 
         PageWatcher(self).start()
         # build the colour table now, so the first hovered pet art doesn't wait for it
@@ -2896,9 +2915,14 @@ class App:
                       command=lambda: (self.minibar.show(self.minibar_on.get()), self._save())
                       ).pack(anchor="w", padx=18, pady=(4, 16))
 
-        lc = self._card(pg, "Font memory", "The app learns your game’s font while you hover. "
-                        "New words are read once by the slower teacher, then recognised instantly.")
+        lc = self._card(pg, "Font memory", "The app reads tooltips with its memory of your game’s font – "
+                        "fast (a few ms). A line it isn’t sure about is marked “not read fully”: hover "
+                        "that pet art again. The careful reader can read such lines instead, but takes "
+                        "about 60 ms per line.")
         lc.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkSwitch(lc, text="Careful reader for unclear lines (slower, learns new text)",
+                      variable=self.careful_on, progress_color=ACCENT, font=self.f(13), text_color=FG,
+                      command=self._careful_changed).pack(anchor="w", padx=18, pady=(4, 0))
         self.learn_lbl = ctk.CTkLabel(lc, text="", font=self.f(13), text_color=FG, anchor="w", justify="left")
         self.learn_lbl.pack(fill="x", padx=18, pady=(4, 16))
 
@@ -3034,6 +3058,10 @@ class App:
         cb = self._btn(row, "Copy code", copy, kind="accent", width=150)
         cb.pack(side="left")
         self._btn(row, "Done", win.destroy, width=100).pack(side="right")
+
+    def _careful_changed(self):
+        self._careful = bool(self.careful_on.get())
+        self._save()
 
     def _style_changed(self):
         self._apply_style()
@@ -3220,7 +3248,7 @@ class App:
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
                 "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
-                "minibar": self.minibar_on, "animations": self.anim_on,
+                "minibar": self.minibar_on, "animations": self.anim_on, "careful_reader": self.careful_on,
                 **{f"style_{k}": v for k, v in self.mark_style.items()}}
 
     def _save(self):
@@ -3631,6 +3659,9 @@ class App:
         if not found:
             if same_item and self.slot_arts.get(slot):
                 return  # tooltip wasn't up this time; keep what we already read
+            if lines and "#plvl" not in lines:
+                self.marks[slot] = "other"   # some other item: no glow, not read again while it's there
+                return
             self.marks.pop(slot, None)  # empty slot / no tooltip
             self.icons.pop(slot, None)
             return
@@ -3660,7 +3691,7 @@ class App:
         self.raw.delete("1.0", "end")
         self.raw.insert("end", "\n".join(pretty.get(l, l) for l in lines))
         if name:
-            self.slot_names[slot] = name
+            self.slot_names[slot] = pet_name(name)
         name = self.slot_names.get(slot, name)
         _, rows = self.evaluate(found)
         matched = self._match_all(found)

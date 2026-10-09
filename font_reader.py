@@ -748,7 +748,9 @@ class FontReader:
         lines = find_lines(rgb, cx, y_from)       # y_from: slot row in the capture (tooltip opens below)
         out, learned = [], False
         arts_zone = False                          # after "Defense against Magic Power": the 7 bonuses
-        for ln in lines:
+        for i, ln in enumerate(lines):
+            if i >= 3 and not any(k == "#plvl" for k, _, _ in out):
+                break      # not a pet art (its 2nd line is always "From PLvl"): don't read the rest
             kind, payload, text = self._classify(ln)
             if kind is None and teach:
                 y, x0, x1 = ln["y"], ln["x0"], ln["x1"]
