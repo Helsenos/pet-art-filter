@@ -3702,14 +3702,20 @@ class App:
 
     def _close_now(self):
         self._closing = True
-        self._save()
-        self._stop()
+        for step in (self._save, self._stop):
+            try:
+                step()
+            except Exception:
+                pass
         try:                                   # nothing scheduled may run after the window is gone
-            for job in self.root.tk.call("after", "info"):
-                self.root.after_cancel(job)
+            for job in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+                self.root.tk.call("after", "cancel", job)   # (not after_cancel: the widgets still own the commands)
         except tk.TclError:
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            os._exit(0)                        # never a window that can't be closed (settings are saved)
 
     # ------------------------------------------------------------ evaluation
     def evaluate(self, found):
