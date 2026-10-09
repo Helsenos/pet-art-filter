@@ -131,6 +131,8 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "pet_art_config.json")
 DEBUG_DIR = os.path.join(APP_DIR, "debug_captures")
+TRAIN_DIR = os.path.join(APP_DIR, "training")   # hard cases the app keeps learning from while idle
+TRAIN_MAX = 300
 FONT_PATH = os.path.join(APP_DIR, "font_memory.pkl")  # what the app has learned of the game font
 MODES = ["Ignore", "Want", "Must"]
 PRESET_COLORS = ["rainbow", "#34d399", "#fbbf24", "#22d3ee", "#f472b6", "#a78bfa", "#60a5fa", "#f87171",
@@ -494,6 +496,8 @@ class OcrWorker(threading.Thread):
                 name, arts, debug = self.reader.read(np.asarray(img), cx)
                 ms = (time.perf_counter() - t) * 1000
                 self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
+                if 0 < len(arts) < ARTS_PER_PET:
+                    save_training(img, cx, debug)
                 try:
                     os.makedirs(DEBUG_DIR, exist_ok=True)
                     base = os.path.join(DEBUG_DIR, f"capture_{seq % 40:02d}")
@@ -505,6 +509,84 @@ class OcrWorker(threading.Thread):
                     pass
             except Exception as e:
                 self.result_q.put(("error", f"{type(e).__name__}: {e}"))
+
+
+def save_training(img, cx, debug):
+    """Keep a pet art that wasn't read completely; the Improver re-reads it later."""
+    try:
+        os.makedirs(TRAIN_DIR, exist_ok=True)
+        base = os.path.join(TRAIN_DIR, time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2))
+        img.save(base + ".png")
+        with open(base + ".json", "w", encoding="utf-8") as fh:
+            json.dump({"cx": cx, "lines": debug, "tries": 0}, fh)
+        files = sorted(f for f in os.listdir(TRAIN_DIR) if f.endswith(".json"))
+        for f in files[:-TRAIN_MAX]:   # keep the newest TRAIN_MAX
+            for ext in (".json", ".png"):
+                try:
+                    os.remove(os.path.join(TRAIN_DIR, f[:-5] + ext))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def training_count():
+    try:
+        return sum(1 for f in os.listdir(TRAIN_DIR) if f.endswith(".json"))
+    except OSError:
+        return 0
+
+
+class Improver(threading.Thread):
+    """The reader's improvement loop: while you're not scanning, re-read the pet arts that
+    came out incomplete. Everything learned since (and the teacher, for lines it still
+    doesn't know) often completes them now - and what it learns makes the next scans
+    better. Solved cases are deleted; ones that still fail after 5 tries are dropped."""
+
+    def __init__(self, app, every=120):
+        super().__init__(daemon=True)
+        self.app, self.every = app, every
+
+    def run(self):
+        while True:
+            time.sleep(self.every)
+            try:
+                self.round()
+            except Exception:
+                pass
+
+    def round(self, limit=40):
+        if self.app.scanner or self.app.ocr_q.qsize() or not os.path.isdir(TRAIN_DIR):
+            return 0
+        solved = 0
+        for f in sorted(os.listdir(TRAIN_DIR), reverse=True)[:limit * 2]:
+            if not f.endswith(".json"):
+                continue
+            if self.app.scanner:      # you started scanning: stop learning, don't slow you down
+                break
+            base = os.path.join(TRAIN_DIR, f[:-5])
+            try:
+                with open(base + ".json", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                rgb = np.asarray(Image.open(base + ".png").convert("RGB"))
+            except Exception:
+                meta, rgb = None, None
+            arts = self.app.reader.read(rgb, meta["cx"])[1] if meta else []
+            if meta is None or len(arts) >= ARTS_PER_PET or meta.get("tries", 0) >= 4:
+                solved += bool(meta) and len(arts) >= ARTS_PER_PET
+                for ext in (".json", ".png"):
+                    try:
+                        os.remove(base + ext)
+                    except OSError:
+                        pass
+            else:
+                meta["tries"] = meta.get("tries", 0) + 1
+                with open(base + ".json", "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh)
+        if solved:
+            self.app.net_q.put(("msg", (f"Learned from {solved} hard pet art{'s' if solved > 1 else ''} "
+                                        "while idle – reading got better.", GOOD)))
+        return solved
 
 
 # ================================================================ overlay
@@ -755,6 +837,8 @@ class App:
             OcrWorker(self.ocr_q, self.result_q, self.reader).start()
 
         PageWatcher(self).start()
+        self.improver = Improver(self)
+        self.improver.start()
         self._bg(self._fetch_official)
         self._bg(self._check_update)
         root.protocol("WM_DELETE_WINDOW", self._close)
@@ -2143,7 +2227,8 @@ class App:
             self.learn_lbl.configure(
                 text=f"Bonus names learned:  {names} / 41\nValues learned:  {values}\n"
                      f"Lines read by the teacher this session:  {self.reader.stats['taught']}\n"
-                     f"Lines read from memory this session:  {self.reader.stats['fast']}")
+                     f"Lines read from memory this session:  {self.reader.stats['fast']}\n"
+                     f"Hard pet arts waiting to be learned (while idle):  {training_count()}")
         self.root.after(30, self._poll)
 
     def _on_result(self, seq, slot, name, found, lines, same_item, ms):
