@@ -25,7 +25,10 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Fixed: glows disappeared while scanning. Now only the part of the game covered by another window (or by Pet Art Filter itself) is left out
+NOTES = """- Faster pet art reading (about 40% faster), same accuracy
+- Glow styles in Settings: choose how good, not good, unread and skipped slots are marked
+- Beep removed
+- Warning when no active preset has bonuses (nothing could glow)
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
