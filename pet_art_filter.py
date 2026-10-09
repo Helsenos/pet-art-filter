@@ -1243,21 +1243,25 @@ class App:
         self.pages_ui = {"scan": self._build_scan(main), "filter": self._build_filter(main),
                          "market": self._build_market(main), "setup": self._build_setup(main),
                          "settings": self._build_settings(main)}
+        # all pages sit in the same spot, laid out once; switching only brings one to the front
+        for page in self.pages_ui.values():
+            page.grid(row=0, column=0, sticky="nsew")
         self._show_page("scan")
 
-    def _show_page(self, key):
+    def _show_page(self, key, force=False):
+        prev = getattr(self, "_page", None)
         self._page = key
-        for k, page in self.pages_ui.items():
-            if k == key:
-                page.grid(row=0, column=0, sticky="nsew")
-            else:
-                page.grid_forget()
-        for k, b in self.nav.items():
+        page = self.pages_ui[key]
+        # bring the page to the front: nothing is laid out or redrawn again (hiding and
+        # re-showing pages made Tk redo every widget on them - that was the lag)
+        getattr(page, "_parent_frame", page).tkraise()
+        for k in {prev, key} if not force else set(self.nav) | {"settings"}:   # restyle only what changed
             on = k == key
-            b.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED)
-        on = key == "settings"
-        self.cog.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED,
-                           image=self._gear["on" if on else "off"])
+            if k in self.nav:
+                self.nav[k].configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED)
+            elif k == "settings":
+                self.cog.configure(fg_color=CARD2 if on else "transparent", text_color=FG if on else MUTED,
+                                   image=self._gear["on" if on else "off"])
         if key == "market" and time.time() - self.market_at > 60:
             self._market_refresh()
 
@@ -2773,7 +2777,7 @@ class App:
             self._recolor(swap)
         self._style()
         self._gear = {"off": gear_icon(MUTED, 14), "on": gear_icon(FG, 14)}
-        self._show_page(self._page)
+        self._show_page(self._page, force=True)
         self._mark_accent()
         if getattr(self, "_save_job", None):
             self.root.after_cancel(self._save_job)
