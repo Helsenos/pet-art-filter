@@ -6,3 +6,4 @@ debug_captures/
 pet_art_config.json
 admin.key
 *.tmp
+*.key
