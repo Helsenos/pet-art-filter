@@ -133,6 +133,8 @@ CONFIG_PATH = os.path.join(APP_DIR, "pet_art_config.json")
 DEBUG_DIR = os.path.join(APP_DIR, "debug_captures")
 TRAIN_DIR = os.path.join(APP_DIR, "training")   # hard cases the app keeps learning from while idle
 TRAIN_MAX = 300
+DATA_DIR = os.path.join(APP_DIR, "dataset")      # small tooltip cut-outs for measuring / tuning the reader
+DATA_MAX = 1500
 FONT_PATH = os.path.join(APP_DIR, "font_memory.pkl")  # what the app has learned of the game font
 MODES = ["Ignore", "Want", "Must"]
 PRESET_COLORS = ["rainbow", "#34d399", "#fbbf24", "#22d3ee", "#f472b6", "#a78bfa", "#60a5fa", "#f87171",
@@ -493,8 +495,10 @@ class OcrWorker(threading.Thread):
             seq, slot, img, cx, same_item = self.ocr_q.get()
             try:
                 t = time.perf_counter()
-                name, arts, debug = self.reader.read(np.asarray(img), cx)
+                name, arts, debug, box = self.reader.read(np.asarray(img), cx, want_box=True)
                 ms = (time.perf_counter() - t) * 1000
+                if arts and box:
+                    save_dataset(img, cx, box, name, arts)
                 self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
                 if 0 < len(arts) < ARTS_PER_PET:
                     save_training(img, cx, debug)
@@ -524,6 +528,30 @@ def save_training(img, cx, debug):
             for ext in (".json", ".png"):
                 try:
                     os.remove(os.path.join(TRAIN_DIR, f[:-5] + ext))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def save_dataset(img, cx, box, name, arts):
+    """Keep a small cut-out of the tooltip (pixel-exact) so the reader can be measured
+    and tuned on real tooltips later. Local only; newest DATA_MAX are kept."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        x0, y0, x1, y1 = box
+        pad = 28
+        x0, y0 = max(0, int(x0) - pad), max(0, int(y0) - pad)
+        x1, y1 = min(img.width, int(x1) + pad), min(img.height, int(y1) + pad)
+        base = os.path.join(DATA_DIR, time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3))
+        img.crop((x0, y0, x1, y1)).save(base + ".png")
+        with open(base + ".json", "w", encoding="utf-8") as fh:
+            json.dump({"cx": cx - x0, "name": name, "arts": arts, "app": updater.APP_VERSION}, fh)
+        files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".json"))
+        for f in files[:-DATA_MAX]:
+            for ext in (".json", ".png"):
+                try:
+                    os.remove(os.path.join(DATA_DIR, f[:-5] + ext))
                 except OSError:
                     pass
     except Exception:
@@ -839,6 +867,8 @@ class App:
         PageWatcher(self).start()
         self.improver = Improver(self)
         self.improver.start()
+        # build the colour table now, so the first hovered pet art doesn't wait for it
+        threading.Thread(target=font_reader._lut, daemon=True).start()
         self._bg(self._fetch_official)
         self._bg(self._check_update)
         root.protocol("WM_DELETE_WINDOW", self._close)

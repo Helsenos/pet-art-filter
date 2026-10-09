@@ -507,9 +507,9 @@ class FontReader:
         return (key, None) if key[0] == "#" else ("text", key[1:])
 
     # ---- reading one tooltip
-    def read(self, rgb, cx, teach=True):
+    def read(self, rgb, cx, teach=True, want_box=False):
         """rgb: HxWx3 capture, cx: slot centre x in it.
-        -> (item name, [(bonus, value)] arts, debug text lines)"""
+        -> (item name, [(bonus, value)] arts, debug text lines[, tooltip box (x0, y0, x1, y1)])"""
         lines = find_lines(rgb, cx)
         out, learned = [], False
         for ln in lines:
@@ -553,4 +553,10 @@ class FontReader:
                 seen.add(payload[0])
                 arts.append(payload)
         debug = [t if t else "?" for _, _, t in out]
+        if want_box:
+            box = None
+            if lines:
+                box = (min(l["x0"] for l in lines), min(l["y"] for l in lines),
+                       max(l["x1"] for l in lines), max(l["y"] for l in lines) + LINE_H)
+            return name, arts, debug, box
         return name, arts, debug
