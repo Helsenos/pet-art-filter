@@ -19,7 +19,7 @@ import tempfile
 import urllib.request
 import zipfile
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 UPDATE_REPO = "Helsenos/pet-art-filter"
 EXE_NAME = "Pet Art Filter.exe"
 USER_AGENT = f"PetArtFilter/{APP_VERSION}"
