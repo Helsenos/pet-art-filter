@@ -686,7 +686,8 @@ class Scanner(threading.Thread):
                     if hide:
                         self._show_overlay()
                     Scanner.seq += 1
-                    self.ocr_q.put((Scanner.seq, cur, img, cx - left, same_item, max(0, int(y0) - top - 4)))
+                    self.ocr_q.put((Scanner.seq, cur, img, cx - left, same_item, max(0, int(y0) - top - 4),
+                                    (left, top)))
                     self.event_q.put(("grabbed", cur))
                 time.sleep(0.004)
 
@@ -701,13 +702,15 @@ class OcrWorker(threading.Thread):
 
     def run(self):
         while True:
-            seq, slot, img, cx, same_item, y_from = self.ocr_q.get()
+            seq, slot, img, cx, same_item, y_from, (left, top) = self.ocr_q.get()
             try:
                 t = time.perf_counter()
                 name, arts, debug, box = self.reader.read(np.asarray(img), cx, teach=self.careful(),
                                                           want_box=True, y_from=y_from)
                 ms = (time.perf_counter() - t) * 1000
-                self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
+                tip = (box[0] + left, box[1] + top, box[2] + left, box[3] + top) \
+                    if box and len(arts) >= ARTS_PER_PET else None      # where the tooltip was on screen
+                self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms, tip)))
                 if len(arts) >= ARTS_PER_PET and box:      # after the result: the glow never waits for this
                     try:
                         pic = tooltip_picture(img, box)
@@ -905,25 +908,38 @@ class GameLayer:
         return None
 
 
+def _click_through_layer(root, vx, vy, vw, vh):
+    """A transparent, click-through, always-on-top window over all screens -> (win, canvas, hwnd)."""
+    win = tk.Toplevel(root)
+    win.overrideredirect(True)
+    win.geometry(f"{vw}x{vh}+{vx}+{vy}")
+    win.configure(bg=KEY_COLOR)
+    win.attributes("-topmost", True)
+    win.attributes("-transparentcolor", KEY_COLOR)
+    cv = tk.Canvas(win, bg=KEY_COLOR, highlightthickness=0)
+    cv.pack(fill="both", expand=True)
+    win.update_idletasks()
+    hwnd = user32.GetParent(win.winfo_id())
+    ex = user32.GetWindowLongW(hwnd, -20)
+    # layered | transparent (click-through) | toolwindow (no taskbar entry)
+    user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80)
+    return win, cv, hwnd
+
+
 class Overlay:
     """Click-through, always-on-top transparent window that draws slot marks."""
 
     def __init__(self, root):
         self.vx, self.vy, vw, vh = virtual_screen()
-        self.win = tk.Toplevel(root)
-        self.win.overrideredirect(True)
-        self.win.geometry(f"{vw}x{vh}+{self.vx}+{self.vy}")
-        self.win.configure(bg=KEY_COLOR)
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-transparentcolor", KEY_COLOR)
-        self.cv = tk.Canvas(self.win, bg=KEY_COLOR, highlightthickness=0)
-        self.cv.pack(fill="both", expand=True)
-        self.win.update_idletasks()
-        hwnd = user32.GetParent(self.win.winfo_id())
-        ex = user32.GetWindowLongW(hwnd, -20)
-        # layered | transparent (click-through) | toolwindow (no taskbar entry)
-        user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80)
-        self.hwnd = hwnd
+        self.vh = vh
+        # the shade over not-good pet arts is its own layer: Windows makes a window see-through
+        # only as a whole, and the glows must stay fully bright (created first = below the glows)
+        self.shade, self.scv, self.shade_hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
+        self.shade.attributes("-alpha", 0.7)
+        self._shade_sig = None
+        self.tips = {}           # (grid, row, col) -> screen box of that slot's tooltip
+        self.tip_rel = None      # where tooltips open, relative to the slot (from the last read)
+        self.win, self.cv, self.hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
         self.set_capture_mode(True)
         self.pulse = False
         self.phase = 0.0
@@ -939,10 +955,80 @@ class Overlay:
         """True: Windows keeps the glow out of every screenshot (best for reading, but
         NVIDIA/OBS then refuse to record: "protected application"). False: recorders work;
         the Scanner hides the glow for one frame while it grabs a tooltip instead."""
+        for hwnd in (self.hwnd, self.shade_hwnd):
+            try:
+                user32.SetWindowDisplayAffinity(hwnd, 0x11 if hide_from_capture else 0)
+            except Exception:
+                pass
+
+    def hide(self):
+        self.win.withdraw()
+        self.shade.withdraw()
+
+    def show(self):
+        self.shade.deiconify()
+        self.win.deiconify()
+
+    def set_shade(self, darkness):
+        """How dark the shade over not-good pet arts is: 0.3 (light) .. 1.0 (black)."""
         try:
-            user32.SetWindowDisplayAffinity(self.hwnd, 0x11 if hide_from_capture else 0)
-        except Exception:
+            self.shade.attributes("-alpha", darkness)
+        except tk.TclError:
             pass
+
+    def learn_tip(self, key, slot_box, tip):
+        """Remember where a tooltip showed up (screen box), so the shade can leave it clear."""
+        sx0, sy0, sx1, sy1 = slot_box
+        t = (tip[0] - 14, tip[1] - 14, tip[2] + 14, tip[3] + 36)   # frame + the [Wearable] line
+        self.tips[key] = t
+        cx = (sx0 + sx1) / 2
+        below = t[1] >= sy0
+        base = sy1 if below else sy0
+        self.tip_rel = (t[0] - cx, t[1] - base, t[2] - cx, t[3] - base, below)
+
+    def _tip_holes(self, grids):
+        """Screen boxes the shade must leave clear right now: the hovered slot and its tooltip
+        (the game draws tooltips below this layer)."""
+        s = slot_at(grids, *cursor_pos())
+        if s is None:
+            return []
+        gi, r, c = s
+        sx0, sy0, sx1, sy1 = slot_rect(grids[gi], r, c)
+        cx = (sx0 + sx1) / 2
+        tip = self.tips.get(s)
+        if tip is None and self.tip_rel is not None:
+            dx0, dy0, dx1, dy1, below = self.tip_rel
+            base = sy1 if below else sy0
+            tip = (cx + dx0, base + dy0, cx + dx1, base + dy1)
+            if tip[1] < self.vy or tip[3] > self.vy + self.vh:
+                tip = None             # near the screen edge the game opens it on the other side
+        if tip is None:                # not known yet: clear the whole area a tooltip can use
+            tip = (cx - CAPTURE["width"] / 2, sy0 - CAPTURE["above"], cx + CAPTURE["width"] / 2,
+                   sy1 + CAPTURE["below"])
+        return [(sx0, sy0, sx1, sy1), tip]
+
+    def _redraw_shade(self, grids, marks, style):
+        ox, oy = self.vx, self.vy
+        rects = []
+        if self.cover != "all" and style.get("bad") == "Shade":
+            holes = self._tip_holes(grids)
+            for (gi, pg, r, c), status in marks.items():
+                if status != "bad" or gi >= len(grids) or pg != self.pages.get(gi, 0):
+                    continue
+                x0, y0, x1, y1 = slot_rect(grids[gi], r, c)
+                if any(x0 < h[2] and h[0] < x1 and y0 < h[3] and h[1] < y1 for h in holes):
+                    continue
+                rects.append((int(x0 - ox) + 1, int(y0 - oy) + 1, int(x1 - ox) - 1, int(y1 - oy) - 1))
+        sig = (tuple(rects), self.cover)
+        if sig == self._shade_sig:      # unchanged: nothing to redraw (no flicker, no work)
+            return
+        self._shade_sig = sig
+        self.scv.delete("all")
+        for box in rects:
+            self.scv.create_rectangle(*box, fill="#000000", outline="")
+        if rects and self.cover and self.cover != "all":
+            l, t, r_, b = self.cover
+            self.scv.create_rectangle(l - ox, t - oy, r_ - ox, b - oy, fill=KEY_COLOR, outline=KEY_COLOR, width=0)
 
     def _tick(self):
         self.ticks += 1
@@ -952,7 +1038,8 @@ class Overlay:
         try:
             self.redraw()
             if self.ticks % 15 == 0 and self.cover != "all":
-                self.win.attributes("-topmost", True)      # stay above the game (it runs as admin)
+                self.shade.attributes("-topmost", True)    # stay above the game (it runs as admin)
+                self.win.attributes("-topmost", True)
         except tk.TclError:
             return                                       # window gone (closing)
         except Exception:
@@ -966,6 +1053,8 @@ class Overlay:
         return safe_color(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
 
     def set(self, grids, marks, show_grid, show_scanned, pages, colors=None):
+        if grids != self.state[0]:
+            self.tips.clear()          # other slots now
         self.state = (grids, marks, show_grid, show_scanned)
         self.pages = pages
         self.colors = colors or {}
@@ -980,6 +1069,7 @@ class Overlay:
 
     def redraw(self):
         grids, marks, show_grid, show_scanned = self.state
+        self._redraw_shade(grids, marks, getattr(self, "style", DEFAULT_STYLE))
         cv = self.cv
         cv.delete("all")
         if self.cover == "all":                  # game minimized
@@ -1026,11 +1116,17 @@ class Overlay:
 
 MARK_STYLES = {
     "good": ["Glow", "Outline", "Corners", "Dot"],
-    "bad": ["Line", "Cross", "Dim", "Off"],
+    "bad": ["Line", "Cross", "Shade", "Off"],
     "incomplete": ["Red X", "Red dot", "Off"],
     "missed": ["Dot", "Off"],
 }
 DEFAULT_STYLE = {k: v[0] for k, v in MARK_STYLES.items()}
+
+
+def _darken(col, d):
+    """#rrggbb darkened by d (0..1) - what the shade layer does to the game, for the preview."""
+    r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(v * (1 - d)) for v in (r, g, b))
 
 
 def draw_mark(cv, status, box, style, cols, phase, pulse, hue, seed=0.0):
@@ -1079,9 +1175,7 @@ def draw_mark(cv, status, box, style, cols, phase, pulse, hue, seed=0.0):
         elif st == "Cross":
             cv.create_line(x1 - 11, y0 + 4, x1 - 4, y0 + 11, fill=safe_color(BAD), width=2)
             cv.create_line(x1 - 4, y0 + 4, x1 - 11, y0 + 11, fill=safe_color(BAD), width=2)
-        elif st == "Dim":
-            cv.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1, fill=safe_color("#000000"), outline="",
-                                stipple="gray50")
+        # "Shade" is drawn by the overlay's own see-through shade layer
     elif status == "incomplete":
         if st == "Red X":
             cv.create_line(x0 + 5, y0 + 5, x1 - 5, y1 - 5, fill=safe_color("#ff2a2a"), width=4)
@@ -1311,6 +1405,7 @@ class App:
         self.show_grid = tk.BooleanVar(value=False)
         self.show_scanned = tk.BooleanVar(value=True)
         self.mark_style = {k: tk.StringVar(value=v) for k, v in DEFAULT_STYLE.items()}   # glow style
+        self.shade_dark = tk.IntVar(value=70)       # how dark "Shade" makes not-good pet arts (%)
         self.only_good = tk.BooleanVar(value=False)
         self.on_top = tk.BooleanVar(value=False)
         self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
@@ -1355,7 +1450,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._close)
         # a close request to any of our windows (Windows shutdown, taskkill...) closes the app
         # cleanly - not just that one window
-        for w in (self.overlay.win, self.minibar.win):
+        for w in (self.overlay.win, self.overlay.shade, self.minibar.win):
             w.protocol("WM_DELETE_WINDOW", self._close)
         root.protocol("WM_SAVE_YOURSELF", self._save)       # logoff / shutdown: save first
         root.after(30, self._poll)
@@ -1592,7 +1687,7 @@ class App:
                 self.game_layer.track((g["x"] + g["w"] / 2, g["y"] + g["h"] / 2) if g else None)
             if self._tick % 3:                 # ~10x a second is plenty
                 return
-            layers = {self.overlay.hwnd, self.minibar.hwnd}
+            layers = {self.overlay.hwnd, self.overlay.shade_hwnd, self.minibar.hwnd}
             fade = getattr(self, "_fade", None)
             if fade is not None:
                 layers.add(user32.GetParent(fade.winfo_id()))
@@ -2995,6 +3090,16 @@ class App:
                                    selected_color=ACCENT, selected_hover_color=ACCENT_H, fg_color=CARD2,
                                    unselected_color=CARD2, unselected_hover_color=BORDER, text_color=FG,
                                    command=lambda _v: self._style_changed()).grid(row=i, column=1, sticky="w", pady=4)
+        ctk.CTkLabel(opts, text="Shade darkness", font=self.f(12), text_color=MUTED, anchor="w", width=150
+                     ).grid(row=4, column=0, sticky="w", pady=4)
+        srow = ctk.CTkFrame(opts, fg_color="transparent")
+        srow.grid(row=4, column=1, sticky="w", pady=4)
+        ctk.CTkSlider(srow, from_=30, to=100, number_of_steps=14, variable=self.shade_dark, width=200,
+                      progress_color=ACCENT, button_color=ACCENT, button_hover_color=ACCENT_H, fg_color=CARD2,
+                      command=lambda _v: self._shade_changed()).pack(side="left")
+        self._shade_lbl = ctk.CTkLabel(srow, text="", font=self.f(12), text_color=MUTED, anchor="w", width=150)
+        self._shade_lbl.pack(side="left", padx=(10, 0))
+        self._shade_text()
         # live preview: a few fake slots drawn exactly like in the game
         self._style_cv = tk.Canvas(body, width=4 * 46 + 14, height=70, bg="#151109", highlightthickness=0)
         self._style_cv.pack(side="right", anchor="n", padx=(16, 0))
@@ -3169,11 +3274,27 @@ class App:
         self._careful = bool(self.careful_on.get())
         self._save()
 
+    def _shade_text(self):
+        v = self._int(self.shade_dark, 70)
+        self._shade_lbl.configure(text="black out" if v >= 100 else f"{v}%  (for “Shade”)")
+
+    def _shade_changed(self):
+        if self.mark_style["bad"].get() != "Shade":      # moving the slider = wanting the shade
+            self.mark_style["bad"].set("Shade")
+        self._shade_text()
+        self._apply_style()
+        if getattr(self, "_shade_job", None):
+            self.root.after_cancel(self._shade_job)
+        self._shade_job = self.root.after(400, self._save)
+
     def _style_changed(self):
         self._apply_style()
         self._save()
 
     def _apply_style(self):
+        if self.mark_style["bad"].get() == "Dim":        # older versions' checkered dim is now the shade
+            self.mark_style["bad"].set("Shade")
+        self.overlay.set_shade(min(100, max(30, self._int(self.shade_dark, 70))) / 100)
         style = {k: v.get() if v.get() in MARK_STYLES[k] else DEFAULT_STYLE[k] for k, v in self.mark_style.items()}
         self.overlay.style = style
         self.overlay.redraw()
@@ -3189,9 +3310,13 @@ class App:
             self._style_phase = (self._style_phase + 0.04) % 1.0
             pulse = int(self._style_phase * 25) % 2 == 0
             style = {k: v.get() for k, v in self.mark_style.items()}
+            dark = min(100, max(30, self._int(self.shade_dark, 70))) / 100
             for i, status in enumerate(("good", "bad", "incomplete", "missed")):
                 x0, y0 = 10 + i * 46, 12
-                cv.create_rectangle(x0, y0, x0 + 34, y0 + 34, fill="#2b241a", outline="#4a3d2a")
+                d = dark if status == "bad" and style.get("bad") == "Shade" else 0
+                cv.create_rectangle(x0, y0, x0 + 34, y0 + 34, fill=_darken("#2b241a", d), outline="#4a3d2a")
+                cv.create_polygon(x0 + 17, y0 + 7, x0 + 27, y0 + 17, x0 + 17, y0 + 27, x0 + 7, y0 + 17,
+                                  fill=_darken("#c9a54e", d), outline="")      # a pet art icon
                 draw_mark(cv, status, (x0, y0, x0 + 34, y0 + 34), style, ["rainbow"], self._style_phase,
                           pulse, self.overlay._hue)
             for i, t in enumerate(("good", "not good", "not read", "skipped")):
@@ -3362,7 +3487,7 @@ class App:
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
                 "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
                 "minibar": self.minibar_on, "animations": self.anim_on, "careful_reader": self.careful_on,
-                **{f"style_{k}": v for k, v in self.mark_style.items()}}
+                "shade_dark": self.shade_dark, **{f"style_{k}": v for k, v in self.mark_style.items()}}
 
     def _save(self):
         cfg = {}
@@ -3423,11 +3548,11 @@ class App:
 
     def _add_grid(self, replace_idx=None):
         self.root.withdraw()
-        self.overlay.win.withdraw()
+        self.overlay.hide()
 
         def done(rect):
             self.root.deiconify()
-            self.overlay.win.deiconify()
+            self.overlay.show()
             if not rect:
                 return
             old = self.grids[replace_idx] if replace_idx is not None else None
@@ -3461,7 +3586,7 @@ class App:
 
     def _auto_grid(self):
         self.root.withdraw()
-        self.overlay.win.withdraw()
+        self.overlay.hide()
 
         def shot_then_pick():
             try:
@@ -3471,7 +3596,7 @@ class App:
                 gray = np.asarray(Image.frombytes("RGB", g.size, g.rgb).convert("L"))
             except Exception as e:
                 self.root.deiconify()
-                self.overlay.win.deiconify()
+                self.overlay.show()
                 self._set_status(f"Couldn’t take a screenshot ({type(e).__name__}) – try again.", WARN)
                 return
             pick_point(self.root, "Click any slot of your inventory or stash  (Esc = cancel)",
@@ -3481,7 +3606,7 @@ class App:
 
     def _auto_grid_done(self, pt, gray, vx, vy):
         self.root.deiconify()
-        self.overlay.win.deiconify()
+        self.overlay.show()
         if pt is None:
             return
         found = grid_finder.find(gray, pt[0] - vx, pt[1] - vy)
@@ -3528,11 +3653,11 @@ class App:
         gi = sel[0]
         g = self.grids[gi]
         self.root.withdraw()
-        self.overlay.win.withdraw()
+        self.overlay.hide()
 
         def done(rect):
             self.root.deiconify()
-            self.overlay.win.deiconify()
+            self.overlay.show()
             if not rect:
                 return
             stash = "stash" in g["name"].lower()
@@ -3610,7 +3735,8 @@ class App:
         cap = dict(CAPTURE)
         self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, TOOLTIP_DELAY_MS,
                                self.ocr_q, self.event_q,
-                               hide_overlay=((self.overlay.hwnd, self.minibar.hwnd), lambda: self._rec_on))
+                               hide_overlay=((self.overlay.hwnd, self.overlay.shade_hwnd, self.minibar.hwnd),
+                                             lambda: self._rec_on))
         self.scanner.start()
         self._set_scanning(True)
 
@@ -3681,7 +3807,7 @@ class App:
         if not animate:
             self._close_now()
             return
-        for w in (self.overlay.win, self.minibar.win):
+        for w in (self.overlay.win, self.overlay.shade, self.minibar.win):
             try:
                 w.withdraw()
             except tk.TclError:
@@ -3853,7 +3979,7 @@ class App:
                          f"Lines read by the teacher this session:  {self.reader.stats['taught']}\n"
                          f"Lines read from memory this session:  {self.reader.stats['fast']}")
 
-    def _on_result(self, seq, slot, name, found, lines, same_item, ms):
+    def _on_result(self, seq, slot, name, found, lines, same_item, ms, tip=None):
         self.read_times = (getattr(self, "read_times", []) + [ms])[-10:]
         self.last_ms = sum(self.read_times) / len(self.read_times)
         sig = tuple(found)
@@ -3878,6 +4004,10 @@ class App:
         if nxt and nxt[1] == sig and nxt[0] != slot:
             self._forget_slot(nxt[0])
             self.marks[nxt[0]] = "missed"
+
+        if tip and slot[0] < len(self.grids):          # the shade keeps tooltips clear
+            self.overlay.learn_tip((slot[0], slot[2], slot[3]),
+                                   slot_rect(self.grids[slot[0]], slot[2], slot[3]), tip)
 
         # hovering the same item again adds to what was read before instead of replacing it
         got = dict(self.slot_arts.get(slot, {})) if same_item else {}
