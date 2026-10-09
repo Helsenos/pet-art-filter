@@ -25,10 +25,9 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Faster pet art reading (about 40% faster), same accuracy
-- Glow styles in Settings: choose how good, not good, unread and skipped slots are marked
-- Beep removed
-- Warning when no active preset has bonuses (nothing could glow)
+NOTES = """- Safer reading: a misread number can no longer become a wrong value (unclear lines are marked "hover again" instead)
+- Unclear bonus lines get a second try on a cleaned-up picture (icons behind the text removed)
+- Update check works even when GitHub limits your connection, and says why if it fails
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
