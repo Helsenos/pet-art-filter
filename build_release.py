@@ -97,6 +97,8 @@ def build():
          "--name", "Pet Art Filter", "--icon", os.path.join(HERE, "app.ico"),
          "--add-data", os.path.join(HERE, "font_memory.pkl") + ";.",
          "--add-data", os.path.join(HERE, "app.ico") + ";.",
+         "--add-data", os.path.join(HERE, "gem.png") + ";.",
+         "--splash", os.path.join(HERE, "splash.png"),
          "--collect-data", "customtkinter", "--collect-all", "rapidocr_onnxruntime",
          "--paths", HERE, "--distpath", dist, "--workpath", work, "--specpath", WORK,
          os.path.join(HERE, "pet_art_filter.py")])

@@ -1075,6 +1075,117 @@ def draw_mark(cv, status, box, style, cols, phase, pulse, hue, seed=0.0):
             cv.create_oval(x1 - 10, y0 + 3, x1 - 3, y0 + 10, fill=safe_color(WARN), outline="")
 
 
+# ================================================================ boot intro
+def gem_image():
+    """The app's gem icon (bundled gem.png) as a PIL image, or None."""
+    try:
+        return Image.open(os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "gem.png")).convert("RGBA")
+    except Exception:
+        return None
+
+
+class Intro:
+    """Boot animation: the gem pops in, a ring of light spreads, sparkles twinkle and the
+    name slides up - then the intro fades out while the app window fades in (~1 s)."""
+    W, H = 420, 330
+
+    def __init__(self, root, on_done):
+        self.root, self.on_done = root, on_done
+        gem = gem_image()
+        self.win = w = tk.Toplevel(root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.configure(bg=BG)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+{(sh - self.H) // 2}")
+        self.cv = cv = tk.Canvas(w, width=self.W, height=self.H, bg=BG, highlightthickness=0)
+        cv.pack()
+        cv.create_rectangle(1, 1, self.W - 2, self.H - 2, outline=BORDER, width=2)
+        self.cx, self.cy = self.W // 2, 128
+        # the gem at every animation step, made once (scaling per frame would be slow)
+        self.frames = []
+        if gem is not None:
+            from PIL import ImageTk
+            for i in range(16):
+                t = i / 15
+                scale = self._back(t)
+                size = max(8, int(150 * (0.55 + 0.45 * scale)))
+                im = gem.resize((size, size), Image.LANCZOS)
+                a = im.getchannel("A").point(lambda v, f=min(1.0, t * 2.2): int(v * f))
+                im.putalpha(a)
+                self.frames.append(ImageTk.PhotoImage(im))
+        self.ring = cv.create_oval(0, 0, 0, 0, outline=BG, width=5)
+        self.gem = cv.create_image(self.cx, self.cy, image=self.frames[0] if self.frames else None)
+        self.stars = [cv.create_polygon(0, 0, 0, 0, fill=BG, outline="") for _ in range(3)]
+        self.title = cv.create_text(self.cx, 248, text="Pet Art Filter", fill=BG, font=("Segoe UI", 22, "bold"))
+        self.sub = cv.create_text(self.cx, 282, text=f"Metin2  ·  Jintea  ·  v{updater.APP_VERSION}", fill=BG,
+                                  font=("Segoe UI", 11))
+        self.t0 = time.perf_counter()
+        w.attributes("-alpha", 1.0)
+        self._tick()
+
+    @staticmethod
+    def _back(t):
+        """ease-out-back: overshoots a little, then settles (the 'pop')"""
+        c = 1.70158
+        t -= 1
+        return 1 + (c + 1) * t ** 3 + c * t ** 2
+
+    @staticmethod
+    def _mix(a, b, t):
+        t = min(1.0, max(0.0, t))
+        ca, cb = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
+
+    def _star(self, item, x, y, r):
+        self.cv.coords(item, x, y - r, x + r * 0.25, y - r * 0.25, x + r, y, x + r * 0.25, y + r * 0.25,
+                       x, y + r, x - r * 0.25, y + r * 0.25, x - r, y, x - r * 0.25, y - r * 0.25)
+
+    def _tick(self):
+        if not self.win.winfo_exists():
+            return
+        ms = (time.perf_counter() - self.t0) * 1000
+        cv, cx, cy = self.cv, self.cx, self.cy
+        if self.frames:                                        # gem pops in (0 - 450 ms)
+            cv.itemconfigure(self.gem, image=self.frames[min(15, int(ms / 450 * 15))])
+        t = (ms - 120) / 520                                   # ring of light spreads and fades
+        if 0 <= t <= 1:
+            r = 62 + 58 * (1 - (1 - t) ** 3)          # stays inside the card
+            cv.coords(self.ring, cx - r, cy - r, cx + r, cy + r)
+            cv.itemconfigure(self.ring, outline=self._mix(ACCENT, BG, t), width=max(1, int(6 * (1 - t))))
+        else:
+            cv.itemconfigure(self.ring, outline=BG)
+        for k, (dx, dy, delay) in enumerate(((84, -62, 200), (-92, 40, 330), (70, 58, 460))):
+            st = (ms - delay) / 380                            # sparkles twinkle
+            r = 11 * math.sin(math.pi * min(1.0, max(0.0, st)))
+            self._star(self.stars[k], cx + dx, cy + dy, max(0.1, r))
+            cv.itemconfigure(self.stars[k], fill=self._mix(BG, "#ffffff", 1.0 if 0 < st < 1 else 0.0))
+        tt = (ms - 300) / 380                                  # name slides up and fades in
+        e = 1 - (1 - min(1.0, max(0.0, tt))) ** 3
+        cv.coords(self.title, cx, 258 - 10 * e)
+        cv.coords(self.sub, cx, 292 - 10 * e)
+        cv.itemconfigure(self.title, fill=self._mix(BG, FG, e))
+        cv.itemconfigure(self.sub, fill=self._mix(BG, MUTED, e))
+        if ms < 850:
+            self.win.after(15, self._tick)
+        else:
+            self.on_done(self)
+
+    def fade_out(self, ms=260):
+        t0 = time.perf_counter()
+
+        def step():
+            if not self.win.winfo_exists():
+                return
+            t = min(1.0, (time.perf_counter() - t0) * 1000 / ms)
+            self.win.attributes("-alpha", 1 - t)
+            if t < 1:
+                self.win.after(15, step)
+            else:
+                self.win.destroy()
+        step()
+
+
 # ================================================================ in-game mini bar
 class MiniBar:
     """Small always-on-top bar to put next to the game's icons: start/stop, clear marks,
@@ -1387,8 +1498,13 @@ class App:
         side.pack_propagate(False)
         logo = ctk.CTkFrame(side, fg_color="transparent")
         logo.pack(fill="x", padx=20, pady=(26, 26))
-        badge = ctk.CTkLabel(logo, text="◆", width=42, height=42, corner_radius=12,
-                             fg_color=ACCENT, text_color="white", font=self.f(20, "bold"))
+        gem = gem_image()
+        if gem is not None:
+            self._logo_img = ctk.CTkImage(gem, size=(42, 42))
+            badge = ctk.CTkLabel(logo, text="", image=self._logo_img, width=42, height=42)
+        else:
+            badge = ctk.CTkLabel(logo, text="◆", width=42, height=42, corner_radius=12,
+                                 fg_color=ACCENT, text_color="white", font=self.f(20, "bold"))
         badge.pack(side="left")
         tb = ctk.CTkFrame(logo, fg_color="transparent")
         tb.pack(side="left", padx=12)
@@ -3543,7 +3659,64 @@ class App:
         if hasattr(self, "tiles"):
             self._update_stats()
 
+    def boot(self):
+        """Show the window - with the intro first when animations are on."""
+        if not self.anim_on.get():
+            self.root.deiconify()
+            return
+        try:
+            Intro(self.root, self._intro_done)
+        except Exception:
+            self.root.deiconify()
+
+    def _intro_done(self, intro):
+        """Cross-fade: the intro fades out while the app window fades in."""
+        r = self.root
+        r.attributes("-alpha", 0.0)
+        r.deiconify()
+        r.lift()
+        intro.fade_out()
+        t0 = time.perf_counter()
+
+        def step():
+            t = min(1.0, (time.perf_counter() - t0) / 0.26)
+            r.attributes("-alpha", t)
+            if t < 1:
+                r.after(15, step)
+        step()
+
     def _close(self):
+        """Closing animation: the window fades out (~0.2 s), then the app closes."""
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        try:
+            animate = self.anim_on.get() and self.root.state() == "normal"
+        except tk.TclError:
+            animate = False
+        if not animate:
+            self._close_now()
+            return
+        for w in (self.overlay.win, self.minibar.win):
+            try:
+                w.withdraw()
+            except tk.TclError:
+                pass
+        t0 = time.perf_counter()
+
+        def step():
+            try:
+                t = min(1.0, (time.perf_counter() - t0) / 0.2)
+                self.root.attributes("-alpha", 1 - t)
+                if t < 1:
+                    self.root.after(15, step)
+                else:
+                    self._close_now()
+            except tk.TclError:
+                self._close_now()
+        step()
+
+    def _close_now(self):
         self._closing = True
         self._save()
         self._stop()
@@ -3839,5 +4012,12 @@ if __name__ == "__main__":
         _cfg = {}
     apply_theme(_cfg.get("theme", "Dark"), _cfg.get("accent", "Violet"))
     root = ctk.CTk()
-    App(root)
+    root.withdraw()                    # shown by app.boot() (after the intro)
+    app = App(root)
+    try:
+        import pyi_splash              # the loading picture of the .exe: done now
+        pyi_splash.close()
+    except Exception:
+        pass
+    app.boot()
     root.mainloop()
