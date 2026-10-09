@@ -17,8 +17,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SUPABASE_URL = ""   # e.g. "https://abcdefgh.supabase.co" - set when the project exists
-SUPABASE_KEY = ""   # the project's public anon key
+SUPABASE_URL = "https://kqxumbdzwwioxfxvmpst.supabase.co"
+SUPABASE_KEY = "sb_publishable_Z_N5IbXaISwnXlCJ1VPQOQ_JEomuCcM"   # public (publishable) key - safe to ship
 TIMEOUT = 10
 
 
