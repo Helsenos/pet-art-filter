@@ -1,0 +1,31 @@
+{
+ "time": "22:21:55",
+ "version": "1.1.6",
+ "scanning": false,
+ "page_shown": "scan",
+ "marks": {
+  "good": 1
+ },
+ "mark_colors": {
+  "(0, 0, 1, 2)": [
+   "rainbow"
+  ]
+ },
+ "pages": {},
+ "cover": null,
+ "overlay_items": 0,
+ "overlay_visible": true,
+ "overlay_topmost": true,
+ "game_exe": null,
+ "game_known": false,
+ "presets_on": [
+  [
+   "My filter",
+   "rainbow",
+   true,
+   1
+  ]
+ ],
+ "loop_ms_max": 0.1,
+ "ocr_queue": 0
+}

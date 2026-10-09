@@ -93,17 +93,33 @@ def _lut():
     return _LUT
 
 
-def text_layer(rgb):
-    """HxWx3 -> HxW float 0..1: how much each pixel looks like tooltip text.
+_VALS = np.arange(256, dtype=np.float32) * (1 / 255)   # 0..255 -> the float layer values
+
+
+def _u8_above(t):
+    """Smallest 0..255 value whose float layer value is > t (so `u8 >= it` == `float > t`)."""
+    return int(np.argmax(_VALS > t)) if (_VALS > t).any() else 256
+
+
+_U20, _U25 = _u8_above(0.2), _u8_above(0.25)
+
+
+def text_layer_u8(rgb):
+    """HxWx3 -> HxW uint8 0..255: how much each pixel looks like tooltip text.
     One table lookup per pixel (the colour maths is done once for every colour)."""
     c = rgb.astype(np.uint32)
     idx = (c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]
-    return _lut()[idx].astype(np.float32) * (1 / 255)
+    return _lut()[idx]
+
+
+def text_layer(rgb):
+    """Same as text_layer_u8, as float 0..1."""
+    return _VALS[text_layer_u8(rgb)]
 
 
 def _remove_borders(layer):
     """The tooltip frame is a thin vertical line in a text colour: wipe long vertical runs."""
-    on = layer > 0.25
+    on = layer >= _U25
     run = np.zeros(on.shape[1], np.int32)
     best = np.zeros(on.shape[1], np.int32)
     for row in on:
@@ -126,8 +142,9 @@ def _segments(cols, min_gap):
 
 def find_frame(layer, cx):
     """The tooltip has a thin frame: two vertical lines of equal height left and right of
-    the slot. -> (left, right, top, bottom) in layer coordinates, or None."""
-    on = layer > 0.2
+    the slot. -> (left, right, top, bottom) in layer coordinates, or None.
+    layer: uint8 (text_layer_u8) or float (text_layer)."""
+    on = (layer >= _U20) if layer.dtype == np.uint8 else (layer > 0.2)
     h, w = on.shape
     # length of the vertical run ending at each pixel: rows counted so far minus the row
     # count at the last "off" pixel above it
@@ -152,22 +169,41 @@ def find_frame(layer, cx):
     return pick
 
 
-def find_lines(rgb, cx):
-    """-> list of dicts (y, x0, x1, img, words) for the tooltip's text lines."""
+_USTRONG = _u8_above(STRONG)
+
+
+def find_lines(rgb, cx, y_from=0):
+    """-> list of dicts (y, x0, x1, img, words) for the tooltip's text lines.
+    y_from: where the slot is in the capture - the tooltip opens below it, so that part is
+    searched first (half the work); if no tooltip frame is found there, the whole capture."""
+    if y_from > 0:
+        out = _find_lines(rgb[y_from:], cx, need_frame=True)
+        if out is not None:
+            for ln in out:
+                ln["y"] += y_from
+            return out
+    return _find_lines(rgb, cx)
+
+
+def _find_lines(rgb, cx, need_frame=False):
     h, w = rgb.shape[:2]
     x0w, x1w = int(max(0, cx - 260)), int(min(w, cx + 260))
-    layer = text_layer(rgb[:, x0w:x1w])
+    layer = text_layer_u8(rgb[:, x0w:x1w])
     frame = find_frame(layer, cx - x0w)
+    if frame and need_frame and frame[2] <= 1:
+        return None          # the frame runs into the top edge: the tooltip starts higher up
     if frame:
         l, r, top_y, bot_y = frame
         sub = layer[:, l + 2:r - 1].copy()
         sub[:max(0, top_y), :] = 0
         sub[bot_y + 1:, :] = 0
         offset, centre = x0w + l + 2, (r - l) / 2 - 2
+    elif need_frame:
+        return None
     else:
         sub = _remove_borders(layer)
         offset, centre = x0w, cx - x0w
-    strong = sub > STRONG
+    strong = sub >= _USTRONG
     rows = strong.sum(1).astype(np.float32)
     cs = np.concatenate(([0.0], np.cumsum(rows)))
     best = (-1e9, 0)
@@ -196,7 +232,7 @@ def find_lines(rgb, cx):
         img = sub[top:top + LINE_H]
         if img.shape[0] < LINE_H:
             img = np.pad(img, ((0, LINE_H - img.shape[0]), (0, 0)))
-        segs = _segments((img > STRONG).any(0), SPACE)
+        segs = _segments((img >= _USTRONG).any(0), SPACE)
         if not segs:
             continue
         ws = chain(segs)
@@ -210,7 +246,7 @@ def find_lines(rgb, cx):
             continue
         a = ws[0][0]
         out.append({"y": top, "x0": a + offset, "x1": ws[-1][1] + offset,
-                    "img": img[:, a:ws[-1][1]], "words": [(s0 - a, e0 - a) for s0, e0 in ws]})
+                    "img": _VALS[img[:, a:ws[-1][1]]], "words": [(s0 - a, e0 - a) for s0, e0 in ws]})
     return out
 
 
@@ -271,30 +307,80 @@ def _diff(a, b):
     return float(_batch_diff(a, b[None])[0])
 
 
+def _padded_diff1(q, P, widths, sq, ss):
+    """_batch_diff1 for candidates zero-padded to one shared width (one numpy batch instead
+    of one per width). Zero columns add nothing to a window that isn't already there, so the
+    result equals the per-width version; pictures of 4 columns or less use the plain mean,
+    exactly as before."""
+    a = q[:, sq:]
+    wa = a.shape[1]
+    b = P[:, :, ss:]
+    wc = max(wa, b.shape[2])
+    if b.shape[2] < wc:
+        b = np.concatenate((b, np.zeros(b.shape[:2] + (wc - b.shape[2],), b.dtype)), 2)
+    if wa < wc:
+        a = np.concatenate((a, np.zeros((a.shape[0], wc - wa), a.dtype)), 1)
+    col = np.abs(b - a[None]).mean(1)
+    cs = np.concatenate((np.zeros((len(col), 1), col.dtype), np.cumsum(col, -1)), -1)
+    span = np.maximum(wa, widths - ss)                  # columns the original compared
+    narrow = span <= 4
+    out = np.empty(len(col), col.dtype)
+    if wc > 4:
+        out[:] = ((cs[:, 4:] - cs[:, :-4]) / 4).max(-1)
+    if narrow.any():
+        out[narrow] = cs[narrow, -1] / span[narrow]
+    return out
+
+
+def _padded_diff(q, P, widths):
+    best = _padded_diff1(q, P, widths, 0, 0)
+    near = np.flatnonzero(best < SHIFT_GATE)
+    if len(near) == 0:
+        return best
+    Pn, wn = P[near], widths[near]
+    for sq, ss in ((1, 0), (0, 1), (2, 0), (0, 2)):
+        best[near] = np.minimum(best[near], _padded_diff1(q, Pn, wn, sq, ss))
+    return best
+
+
 class _Index:
-    """Pictures of one table grouped by width, so a query is compared with all
-    candidates of similar width in a few numpy operations."""
+    """Pictures of one table, zero-padded to one width, so a query is compared with all
+    candidates of similar width (+-2 px) in one numpy batch."""
 
     def __init__(self, items):
         groups = {}
         for label, pic in items:
             groups.setdefault(pic.shape[1], []).append((label, pic))
         self.by_w = {w: ([l for l, _ in g], np.stack([p for _, p in g])) for w, g in groups.items()}
+        # candidates ordered by width (same order the per-width search used: same tie-breaking)
+        self.labels, pics = [], []
+        for w in sorted(self.by_w):
+            labels, stack = self.by_w[w]
+            self.labels += labels
+            pics += list(stack)
+        self.widths = np.array([p.shape[1] for p in pics], np.int64)
+        if pics:
+            h, wmax = pics[0].shape[0], int(self.widths.max())
+            self.pad = np.zeros((len(pics), h, wmax), pics[0].dtype)
+            for i, p in enumerate(pics):
+                self.pad[i, :, :p.shape[1]] = p
+        else:
+            self.pad = None
 
     def best(self, q, tol, speck=False):
-        per, pic = {}, {}
-        wq = q.shape[1]
-        for w in range(wq - 2, wq + 3):
-            g = self.by_w.get(w)
-            if g is None:
-                continue
-            labels, stack = g
-            for i, (l, d) in enumerate(zip(labels, _batch_diff(q, stack))):
-                if d < per.get(l, 9):
-                    per[l] = d
-                    pic[l] = stack[i]
-        if not per:
+        if self.pad is None:
             return None
+        wq = q.shape[1]
+        sel = np.flatnonzero(np.abs(self.widths - wq) <= 2)
+        if len(sel) == 0:
+            return None
+        diffs = _padded_diff(q, self.pad[sel], self.widths[sel])
+        per, pic = {}, {}
+        for i, d in zip(sel.tolist(), diffs.tolist()):
+            l = self.labels[i]
+            if d < per.get(l, 9):
+                per[l] = d
+                pic[l] = self.pad[i, :, :self.widths[i]]
         ranked = sorted(per.items(), key=lambda kv: kv[1])
         l1, d1 = ranked[0]
         d2 = ranked[1][1] if len(ranked) > 1 else 9.0
@@ -625,10 +711,10 @@ class FontReader:
         return (key, None) if key[0] == "#" else ("text", key[1:])
 
     # ---- reading one tooltip
-    def read(self, rgb, cx, teach=True, want_box=False):
+    def read(self, rgb, cx, teach=True, want_box=False, y_from=0):
         """rgb: HxWx3 capture, cx: slot centre x in it.
         -> (item name, [(bonus, value)] arts, debug text lines[, tooltip box (x0, y0, x1, y1)])"""
-        lines = find_lines(rgb, cx)
+        lines = find_lines(rgb, cx, y_from)       # y_from: slot row in the capture (tooltip opens below)
         out, learned = [], False
         for ln in lines:
             kind, payload, text = self._classify(ln)

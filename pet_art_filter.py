@@ -57,11 +57,6 @@ import updater
 
 MSS = getattr(mss, "MSS", None) or mss.mss
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
-
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
 try:
@@ -657,7 +652,7 @@ class Scanner(threading.Thread):
                     if hide:
                         self._show_overlay()
                     self.seq += 1
-                    self.ocr_q.put((self.seq, cur, img, cx - left, same_item))
+                    self.ocr_q.put((self.seq, cur, img, cx - left, same_item, max(0, int(y0) - top - 4)))
                     self.event_q.put(("grabbed", cur))
                 time.sleep(0.004)
 
@@ -671,10 +666,10 @@ class OcrWorker(threading.Thread):
 
     def run(self):
         while True:
-            seq, slot, img, cx, same_item = self.ocr_q.get()
+            seq, slot, img, cx, same_item, y_from = self.ocr_q.get()
             try:
                 t = time.perf_counter()
-                name, arts, debug, box = self.reader.read(np.asarray(img), cx, want_box=True)
+                name, arts, debug, box = self.reader.read(np.asarray(img), cx, want_box=True, y_from=y_from)
                 ms = (time.perf_counter() - t) * 1000
                 self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
                 if len(arts) >= ARTS_PER_PET and box:      # after the result: the glow never waits for this
@@ -1215,7 +1210,6 @@ class App:
         self.cap_above = tk.IntVar(value=520)
         self.cap_below = tk.IntVar(value=480)
         self.ocr_scale = tk.DoubleVar(value=2.5)
-        self.beep = tk.BooleanVar(value=True)
         self.show_grid = tk.BooleanVar(value=False)
         self.show_scanned = tk.BooleanVar(value=True)
         self.only_good = tk.BooleanVar(value=False)
@@ -1357,8 +1351,6 @@ class App:
         self._btn(bottom, "Clear marks", self._clear_marks).pack(fill="x")
         sw = ctk.CTkFrame(bottom, fg_color="transparent")
         sw.pack(fill="x", pady=(16, 0))
-        ctk.CTkSwitch(sw, text="Beep on good", variable=self.beep, progress_color=ACCENT,
-                      font=self.f(13), text_color=FG, command=self._save).pack(anchor="w", pady=4)
         ctk.CTkSwitch(sw, text="Always on top", variable=self.on_top, progress_color=ACCENT,
                       font=self.f(13), text_color=FG,
                       command=lambda: self.root.attributes("-topmost", self.on_top.get())
@@ -3132,7 +3124,7 @@ class App:
         return {"min_matches": self.min_matches, "delay_ms": self.delay_ms,
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
-                "beep": self.beep, "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
+                "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
                 "minibar": self.minibar_on, "animations": self.anim_on}
 
     def _save(self):
@@ -3364,6 +3356,11 @@ class App:
             self._set_status("Add a grid first on the Setup page", WARN)
             self._show_page("setup")
             return
+        if not any(p.get("on", True) and p.get("bonuses") for p in self._all_profiles()):
+            # nothing could ever count as good: say so instead of silently showing no glow
+            self._set_verdict("Nothing can glow", WARN, "No preset that's turned on has any bonuses. "
+                              "Go to Filter: turn a preset on (●) and pick bonuses.")
+            self._set_status("No active preset has bonuses – nothing can glow. Check the Filter page.", WARN)
         self._save()
         self.show_grid.set(False)
         self._refresh_overlay()
@@ -3434,6 +3431,47 @@ class App:
     def _poll(self):
         if getattr(self, "_closing", False):
             return
+        _t0 = time.perf_counter()
+        try:
+            self._poll_body()
+        finally:
+            ms = (time.perf_counter() - _t0) * 1000
+            self._poll_max = max(getattr(self, "_poll_max", 0.0), ms)
+            if getattr(self, "_tick", 0) % 33 == 0:
+                self._write_live_state()
+            self.root.after(30, self._poll)
+
+    def _write_live_state(self):
+        """Diagnostics: what the app sees right now (APP_DIR/live_state.json)."""
+        try:
+            from collections import Counter
+            ov = self.overlay
+            state = {
+                "time": time.strftime("%H:%M:%S"), "version": updater.APP_VERSION,
+                "scanning": bool(self.scanner), "page_shown": self._page,
+                "marks": dict(Counter(self.marks.values())),
+                "mark_colors": {str(k): v for k, v in list(self.mark_colors.items())[:10]},
+                "pages": {str(k): v for k, v in self.pages.items()},
+                "cover": ov.cover, "overlay_items": len(ov.cv.find_all()),
+                "overlay_visible": bool(user32.IsWindowVisible(ov.hwnd)),
+                "overlay_topmost": bool(user32.GetWindowLongW(ov.hwnd, -20) & 8),
+                "game_exe": self.game_layer.exe, "game_known": bool(self.game_layer.game),
+                "presets_on": [(p["name"], p.get("color"), p.get("on", True), len(p.get("bonuses") or {}))
+                               for p in self._all_profiles()],
+                "loop_ms_max": round(getattr(self, "_poll_max", 0.0), 1),
+                "ocr_queue": self.ocr_q.qsize(),
+            }
+            self._poll_max = 0.0
+            with open(os.path.join(APP_DIR, "live_state.json"), "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=1, default=str)
+        except Exception as e:
+            try:
+                with open(os.path.join(APP_DIR, "live_state.json"), "w", encoding="utf-8") as fh:
+                    fh.write(f"error {type(e).__name__}: {e}")
+            except OSError:
+                pass
+
+    def _poll_body(self):
         # hotkeys
         for vk, fn in ((VK_F6, self._toggle), (VK_F7, self._clear_marks)):
             down = key_down(vk)
@@ -3488,7 +3526,6 @@ class App:
                     text=f"Bonus names learned:  {names} / 41\nValues learned:  {values}\n"
                          f"Lines read by the teacher this session:  {self.reader.stats['taught']}\n"
                          f"Lines read from memory this session:  {self.reader.stats['fast']}")
-        self.root.after(30, self._poll)
 
     def _on_result(self, seq, slot, name, found, lines, same_item, ms):
         self.read_times = (getattr(self, "read_times", []) + [ms])[-10:]
@@ -3534,7 +3571,7 @@ class App:
         good = bool(matched)
         complete = len(found) >= ARTS_PER_PET
         if complete and slot[0] < len(self.grids):
-            x0, y0, x1, y1 = slot_rect(self.grids[slot[0]], slot[1], slot[2])
+            x0, y0, x1, y1 = slot_rect(self.grids[slot[0]], slot[2], slot[3])   # slot = (grid, page, row, col)
             if self.game_layer.learn((x0 + x1) / 2, (y0 + y1) / 2):
                 self._save()
         if complete:
@@ -3572,8 +3609,6 @@ class App:
                                    tags=(tag,))
             self.hist_slots[iid] = slot
         self._update_stats()
-        if good and self.beep.get() and winsound:
-            threading.Thread(target=lambda: winsound.Beep(1500, 120), daemon=True).start()
 
     def _recheck(self):
         """Re-apply the filter to everything already scanned (after changing the filter)."""
