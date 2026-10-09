@@ -33,6 +33,19 @@ from tkinter import ttk, simpledialog, messagebox
 
 import customtkinter as ctk
 
+
+def _fast_scrollbar_set(self, start_value, end_value):
+    """CustomTkinter redraws AND recolours its scrollbar on every scroll step (~19 ms).
+    Skip it when nothing moved, and don't recolour when only the position changed."""
+    start_value, end_value = float(start_value), float(end_value)
+    if (start_value, end_value) == (getattr(self, "_start_value", None), getattr(self, "_end_value", None)):
+        return
+    self._start_value, self._end_value = start_value, end_value
+    self._draw(no_color_updates=True)
+
+
+ctk.CTkScrollbar.set = _fast_scrollbar_set
+
 import mss
 from PIL import Image, ImageChops, ImageStat, ImageTk
 import numpy as np
@@ -549,6 +562,9 @@ class PageWatcher(threading.Thread):
     def run(self):
         with MSS() as sct:
             while True:
+                if not self.app.scanner and not self.app.marks:
+                    time.sleep(0.25)       # idle and nothing glowing: no screenshots at all
+                    continue
                 for gi, g in enumerate(list(self.app.grids)):
                     if not g.get("tabs"):
                         continue
@@ -559,7 +575,8 @@ class PageWatcher(threading.Thread):
                     if pg is not None and self.app.pages.get(gi) != pg:
                         self.app.pages[gi] = pg
                         self.app.event_q.put(("page", gi))
-                time.sleep(0.04)
+                # fast while scanning; otherwise only so the glow follows page flips
+                time.sleep(0.04 if self.app.scanner else 0.25)
 
 
 # ================================================================ scanner
@@ -1194,6 +1211,7 @@ class App:
         self._popup_shown = set()
         self._bg(self._check_update)
         root.after(UPDATE_EVERY_MS, self._periodic_update_check)
+        root.after(3000, self._prebuild_cards)
         root.protocol("WM_DELETE_WINDOW", self._close)
         root.after(30, self._poll)
 
@@ -1665,34 +1683,64 @@ class App:
         self._recheck()
 
     def _render_presets(self):
+        """Preset pills + tools. Widgets are built once and only restyled on clicks
+        (rebuilding everything took ~150 ms per click; restyling takes a few ms)."""
+        bar, tools = self.preset_bar, self.preset_tools
+        allp = self._all_profiles()
+        cur = self._find_profile(self.current)
+        shape = (tuple((p["id"], p["name"], p["official"]) for p in allp),
+                 bool(cur and cur["official"]), bool(self.admin_key and cloud.configured()), cur is None)
+        if shape != getattr(self, "_preset_shape", None):
+            self._preset_shape = shape
+            self._build_preset_widgets(allp, cur)
+        for p in allp:
+            w = self._preset_w.get(p["id"])
+            if not w:
+                continue
+            sel, on = p["id"] == self.current, p.get("on", True)
+            state = (sel, on, p["color"])
+            if w["state"] == state:
+                continue
+            w["state"] = state
+            w["pill"].configure(fg_color=CARD2 if sel else CARD, border_width=2 if sel else 1,
+                                border_color=ACCENT if sel else BORDER)
+            w["dot"].configure(text="●" if on else "○", text_color=_swatch(p["color"]))
+            w["name"].configure(text_color=FG if on else MUTED, font=self.f(12, "bold" if sel else "normal"))
+        if cur:
+            for col, btn in self._swatch_w.items():
+                mine = cur["color"] == col
+                if getattr(btn, "_mine", None) != mine:
+                    btn._mine = mine
+                    btn.configure(border_width=2 if mine else 0)
+
+    def _build_preset_widgets(self, allp, cur):
         bar, tools = self.preset_bar, self.preset_tools
         for w in bar.winfo_children() + tools.winfo_children():
             w.destroy()
-        allp = self._all_profiles()
+        self._preset_w, self._swatch_w = {}, {}
         for i, p in enumerate(allp):
-            sel = p["id"] == self.current
-            on = p.get("on", True)
-            pill = ctk.CTkFrame(bar, fg_color=CARD2 if sel else CARD, corner_radius=16,
-                                border_width=2 if sel else 1, border_color=ACCENT if sel else BORDER)
+            pill = ctk.CTkFrame(bar, fg_color=CARD, corner_radius=16, border_width=1, border_color=BORDER)
             pill.grid(row=i // 4, column=i % 4, sticky="w", padx=3, pady=3)
-            ctk.CTkButton(pill, text="●" if on else "○", width=26, height=26, corner_radius=13,
-                          fg_color="transparent", hover_color=BORDER, text_color=_swatch(p["color"]),
-                          font=self.f(16), command=lambda pid=p["id"]: self._toggle_profile(pid)
-                          ).pack(side="left", padx=(4, 0), pady=2)
-            ctk.CTkButton(pill, text=("★ " if p["official"] else "") + p["name"], height=26,
-                          fg_color="transparent", hover_color=BORDER, text_color=FG if on else MUTED,
-                          font=self.f(12, "bold" if sel else "normal"), width=40,
-                          command=lambda pid=p["id"]: self._select_profile(pid)).pack(side="left", padx=(0, 8))
-        cur = self._find_profile(self.current)
+            dot = ctk.CTkButton(pill, text="●", width=26, height=26, corner_radius=13,
+                                fg_color="transparent", hover_color=BORDER, text_color=_swatch(p["color"]),
+                                font=self.f(16), command=lambda pid=p["id"]: self._toggle_profile(pid))
+            dot.pack(side="left", padx=(4, 0), pady=2)
+            name = ctk.CTkButton(pill, text=("★ " if p["official"] else "") + p["name"], height=26,
+                                 fg_color="transparent", hover_color=BORDER, text_color=FG,
+                                 font=self.f(12), width=40, command=lambda pid=p["id"]: self._select_profile(pid))
+            name.pack(side="left", padx=(0, 8))
+            self._preset_w[p["id"]] = {"pill": pill, "dot": dot, "name": name, "state": None}
         if not cur:
             return
         ctk.CTkLabel(tools, text="Colour", font=self.f(12), text_color=MUTED).pack(side="left", padx=(0, 6))
         for col in PRESET_COLORS:
-            mine = cur["color"] == col
-            ctk.CTkButton(tools, text="R" if col == "rainbow" else "", width=24, height=24, corner_radius=12,
-                          fg_color=_swatch(col), hover_color=_swatch(col), text_color="white",
-                          border_width=2 if mine else 0, border_color="#ffffff", font=self.f(10, "bold"),
-                          command=lambda c=col: self._set_profile_color(c)).pack(side="left", padx=2)
+            btn = ctk.CTkButton(tools, text="R" if col == "rainbow" else "", width=24, height=24, corner_radius=12,
+                                fg_color=_swatch(col), hover_color=_swatch(col), text_color="white",
+                                border_width=0, border_color="#ffffff", font=self.f(10, "bold"),
+                                command=lambda c=col: self._set_profile_color(c))
+            btn._keep_colors = True
+            btn.pack(side="left", padx=2)
+            self._swatch_w[col] = btn
         self._btn(tools, "+ New", self._new_profile, width=70, height=28).pack(side="left", padx=(14, 4))
         self._btn(tools, "Duplicate", self._dup_profile, width=84, height=28).pack(side="left", padx=4)
         if not cur["official"]:
@@ -1726,74 +1774,125 @@ class App:
         return [p for p in self._all_profiles() if p.get("on", True) and self._profile_matches(p, found)]
 
     def _render_selected(self):
+        """Cards of the picked bonuses. Each bonus gets its card once; afterwards cards are
+        only shown / hidden / restyled, which keeps clicks instant."""
         f = self.sel_frame
-        for w in f.winfo_children():
-            w.destroy()
+        if not hasattr(self, "_sel_cards"):
+            self._sel_cards, self._sel_shown = {}, None
+            self._sel_empty = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+            ctk.CTkLabel(self._sel_empty, text="Nothing picked yet – add bonuses below.", font=self.f(13),
+                         text_color=MUTED).pack(pady=20)
         chosen = [n for n in BONUSES if self.vars[n][0].get() != "Ignore"]
         musts = sum(1 for n in chosen if self.vars[n][0].get() == "Must")
         need = self._int(self.min_matches, 1)
         if not chosen:
-            e = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
-            e.grid(row=0, column=0, columnspan=2, sticky="ew")
-            ctk.CTkLabel(e, text="Nothing picked yet – add bonuses below.", font=self.f(13),
-                         text_color=MUTED).pack(pady=20)
-            self.rule_hint.configure(text="Pick at least one bonus, otherwise nothing will glow.",
-                                     text_color=WARN)
-            return
-        hint = (f"A bonus counts when its value is at or above the minimum you set. "
-                f"{len(chosen)} picked")
-        if musts:
-            hint += f", {musts} marked MUST (always required)"
-        if need > len(chosen):
-            self.rule_hint.configure(text=hint + f". You need {need} but only picked {len(chosen)}, "
-                                                 "so nothing can glow.", text_color=WARN)
+            self.rule_hint.configure(text="Pick at least one bonus, otherwise nothing will glow.", text_color=WARN)
         else:
-            self.rule_hint.configure(text=hint + ".", text_color=MUTED)
-        for i, name in enumerate(chosen):
-            mode, mn = self.vars[name]
-            lo, hi = BONUSES[name]
-            must = mode.get() == "Must"
-            col = MUST_COL if must else ACCENT
-            card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14, border_width=1,
-                                border_color=col if must else BORDER)
-            card.grid(row=i // 2, column=i % 2, sticky="ew", padx=(0 if i % 2 == 0 else 6, 6 if i % 2 == 0 else 0),
-                      pady=6)
-            top = ctk.CTkFrame(card, fg_color="transparent")
-            top.pack(fill="x", padx=16, pady=(12, 0))
-            ctk.CTkLabel(top, text=name, font=self.f(14, "bold"), text_color=FG).pack(side="left")
-            ctk.CTkButton(top, text="✕", width=28, height=28, corner_radius=8, fg_color="transparent",
-                          hover_color=DANGER_H, text_color=MUTED, font=self.f(13),
-                          command=lambda n=name: self._set_mode(n, "Ignore")).pack(side="right")
-            seg = ctk.CTkSegmentedButton(top, values=["Want", "Must"], height=26, font=self.f(11, "bold"),
-                                         selected_color=col, selected_hover_color=col,
-                                         unselected_color=CARD2, unselected_hover_color=BORDER,
-                                         fg_color=CARD2, text_color=FG,
-                                         command=lambda v, n=name: self._set_mode(n, v))
-            seg.set("Must" if must else "Want")
-            seg.pack(side="right", padx=8)
-            bot = ctk.CTkFrame(card, fg_color="transparent")
-            bot.pack(fill="x", padx=16, pady=(8, 14))
-            step = 50 if hi >= 1000 else 10 if hi >= 200 else 5 if hi >= 100 else 1
-            val = ctk.CTkLabel(bot, text=f"≥ {mn.get()}", font=self.f(14, "bold"), text_color=GOOD,
-                               width=66, anchor="w")
-            val.pack(side="left")
+            hint = (f"A bonus counts when its value is at or above the minimum you set. "
+                    f"{len(chosen)} picked")
+            if musts:
+                hint += f", {musts} marked MUST (always required)"
+            if need > len(chosen):
+                self.rule_hint.configure(text=hint + f". You need {need} but only picked {len(chosen)}, "
+                                                     "so nothing can glow.", text_color=WARN)
+            else:
+                self.rule_hint.configure(text=hint + ".", text_color=MUTED)
+        if tuple(chosen) != self._sel_shown:      # which cards are visible, in which order
+            keep = set(chosen)
+            for name, card in self._sel_cards.items():   # hide only the cards that go away
+                if name not in keep and card.get("pos") is not None:
+                    card["frame"].grid_forget()
+                    card["pos"] = None
+            if chosen:
+                self._sel_empty.grid_forget()
+            else:
+                self._sel_empty.grid(row=0, column=0, columnspan=2, sticky="ew")
+            for i, name in enumerate(chosen):            # move only the cards whose place changed
+                card = self._sel_cards.get(name) or self._make_sel_card(name)
+                pos = (i // 2, i % 2)
+                if card.get("pos") != pos:
+                    card["frame"].grid(row=pos[0], column=pos[1], sticky="ew",
+                                       padx=(0 if pos[1] == 0 else 6, 6 if pos[1] == 0 else 0), pady=6)
+                    card["pos"] = pos
+            self._sel_shown = tuple(chosen)
+        for name in chosen:
+            self._style_sel_card(self._sel_cards[name], name)
 
-            def moved(v, var=mn, lbl=val, st=step, lo_=lo):
-                self._ensure_editable()
-                iv = int(round((v - lo_) / st) * st + lo_)
-                var.set(iv)
-                lbl.configure(text=f"≥ {iv}")
+    def _prebuild_cards(self, names=None):
+        """Build the bonus cards in the background (one every 40 ms) so even the first
+        click on a bonus is instant."""
+        if names is None:
+            self._render_selected()
+            names = [n for n in BONUSES if n not in self._sel_cards]
+        if names and not getattr(self, "_closing", False):
+            n = names.pop(0)
+            if n not in self._sel_cards:
+                self._make_sel_card(n)
+            self.root.after(40, lambda: self._prebuild_cards(names))
 
-            sl = ctk.CTkSlider(bot, from_=lo, to=hi, number_of_steps=max(1, (hi - lo) // step),
-                               progress_color=col, button_color=col, button_hover_color=FG,
-                               fg_color=CARD2, height=16, command=moved)
-            sl.set(mn.get())
-            sl.pack(side="left", fill="x", expand=True, padx=8)
-            sl.bind("<ButtonRelease-1>", lambda e: self._filter_changed())
-            ctk.CTkLabel(bot, text=f"max {hi}", font=self.f(12), text_color=MUTED).pack(side="left")
+    def _make_sel_card(self, name):
+        f = self.sel_frame
+        mode, mn = self.vars[name]
+        lo, hi = BONUSES[name]
+        frame = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        top = ctk.CTkFrame(frame, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(12, 0))
+        ctk.CTkLabel(top, text=name, font=self.f(14, "bold"), text_color=FG).pack(side="left")
+        ctk.CTkButton(top, text="✕", width=28, height=28, corner_radius=8, fg_color="transparent",
+                      hover_color=DANGER_H, text_color=MUTED, font=self.f(13),
+                      command=lambda n=name: self._set_mode(n, "Ignore")).pack(side="right")
+        seg = ctk.CTkSegmentedButton(top, values=["Want", "Must"], height=26, font=self.f(11, "bold"),
+                                     selected_color=ACCENT, selected_hover_color=ACCENT,
+                                     unselected_color=CARD2, unselected_hover_color=BORDER,
+                                     fg_color=CARD2, text_color=FG,
+                                     command=lambda v, n=name: self._set_mode(n, v))
+        seg.pack(side="right", padx=8)
+        bot = ctk.CTkFrame(frame, fg_color="transparent")
+        bot.pack(fill="x", padx=16, pady=(8, 14))
+        step = 50 if hi >= 1000 else 10 if hi >= 200 else 5 if hi >= 100 else 1
+        val = ctk.CTkLabel(bot, text="", font=self.f(14, "bold"), text_color=GOOD, width=66, anchor="w")
+        val.pack(side="left")
+
+        def moved(v, var=mn, lbl=val, st=step, lo_=lo):
+            self._ensure_editable()
+            iv = int(round((v - lo_) / st) * st + lo_)
+            var.set(iv)
+            lbl.configure(text=f"≥ {iv}")
+
+        sl = ctk.CTkSlider(bot, from_=lo, to=hi, number_of_steps=max(1, (hi - lo) // step),
+                           progress_color=ACCENT, button_color=ACCENT, button_hover_color=FG,
+                           fg_color=CARD2, height=16, command=moved)
+        sl.pack(side="left", fill="x", expand=True, padx=8)
+        sl.bind("<ButtonRelease-1>", lambda e: self._filter_changed())
+        ctk.CTkLabel(bot, text=f"max {hi}", font=self.f(12), text_color=MUTED).pack(side="left")
+        card = {"frame": frame, "seg": seg, "val": val, "sl": sl, "state": None}
+        self._sel_cards[name] = card
+        return card
+
+    def _style_sel_card(self, card, name):
+        mode, mn = self.vars[name]
+        must = mode.get() == "Must"
+        state = (must, mn.get(), ACCENT)
+        if card["state"] == state:
+            return
+        old = card["state"]
+        card["state"] = state
+        col = MUST_COL if must else ACCENT
+        if old is None or old[0] != must or old[2] != ACCENT:
+            card["frame"].configure(border_color=col if must else BORDER)
+            card["seg"].configure(selected_color=col, selected_hover_color=col)
+            card["sl"].configure(progress_color=col, button_color=col)
+        card["seg"].set("Must" if must else "Want")
+        if old is None or old[1] != mn.get():
+            card["sl"].set(mn.get())
+            card["val"].configure(text=f"≥ {mn.get()}")
 
     def _chip_style(self, chip, name):
         mode = self.vars[name][0].get()
+        state = (mode, ACCENT, CARD)
+        if getattr(chip, "_state", None) == state:      # unchanged: skip the (slow) redraw
+            return
+        chip._state = state
         label = name.replace("Strong against ", "vs ")
         if mode == "Want":
             chip.configure(text="✓  " + label, fg_color=ACCENT, hover_color=ACCENT_H,
