@@ -1482,8 +1482,14 @@ class App:
         r = self.root
         r.title("Pet Art Filter - Jintea")
         icon = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "app.ico")
-        if os.path.exists(icon):   # CustomTkinter sets its own icon shortly after start
-            r.after(300, lambda i=icon: r.iconbitmap(i))
+        if os.path.exists(icon):
+            # right away: then CustomTkinter skips its own icon; default= covers every window
+            try:
+                r.iconbitmap(icon)
+                r.iconbitmap(default=icon)
+            except tk.TclError:
+                pass
+            self._icon_path = icon
         r.configure(fg_color=BG)
         r.geometry("1280x840")
         r.minsize(1100, 700)
@@ -3658,8 +3664,32 @@ class App:
         if hasattr(self, "tiles"):
             self._update_stats()
 
+    def _set_taskbar_icon(self):
+        """Give the window its icon straight through Windows (big for the taskbar, small for the
+        title bar) - Tk alone sometimes leaves the window without one."""
+        icon = getattr(self, "_icon_path", None)
+        if not icon:
+            return
+        try:
+            hwnd = user32.GetParent(self.root.winfo_id())
+            load = user32.LoadImageW
+            load.restype = wt.HANDLE
+            load.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT]
+            send = user32.SendMessageW
+            send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+            big = load(None, icon, 1, user32.GetSystemMetrics(11), user32.GetSystemMetrics(12), 0x10)
+            small = load(None, icon, 1, user32.GetSystemMetrics(49), user32.GetSystemMetrics(50), 0x10)
+            if big:
+                send(hwnd, 0x80, 1, big)        # WM_SETICON, ICON_BIG
+            if small:
+                send(hwnd, 0x80, 0, small)      # WM_SETICON, ICON_SMALL
+        except Exception:
+            pass
+
     def boot(self):
         """Show the window - with the intro first when animations are on."""
+        self.root.after(50, self._set_taskbar_icon)
+        self.root.after(1500, self._set_taskbar_icon)     # once more, after the intro
         if not self.anim_on.get():
             self.root.deiconify()
             return
@@ -4010,6 +4040,10 @@ if __name__ == "__main__":
     except Exception:
         _cfg = {}
     apply_theme(_cfg.get("theme", "Dark"), _cfg.get("accent", "Violet"))
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Helsenos.PetArtFilter")
+    except Exception:
+        pass
     root = ctk.CTk()
     root.withdraw()                    # shown by app.boot() (after the intro)
     app = App(root)
