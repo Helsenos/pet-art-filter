@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+debug_captures/
+pet_art_config.json
+admin.key
+*.tmp
