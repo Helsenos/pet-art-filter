@@ -26,9 +26,7 @@ WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyI
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
 NOTES = """\
-- Updates are now digitally signed: the app only installs updates that really come from the app owner
-- Safer market: broken or fake listings can't freeze the app anymore
-- Fixed: the app no longer keeps asking the server about a disabled seller code
+- Market listings now show the real in-game tooltip picture
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
