@@ -1097,6 +1097,7 @@ class App:
         self.only_good = tk.BooleanVar(value=False)
         self.on_top = tk.BooleanVar(value=False)
         self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
+        self.anim_on = tk.BooleanVar(value=True)      # page fade + sliding menu marker
         self.minibar_on = tk.BooleanVar(value=True)   # small bar on the game screen
         self.minibar_pos = None
         self.market_match = tk.BooleanVar(value=False)
@@ -1213,6 +1214,11 @@ class App:
                                  hover_color=CARD2, text_color=MUTED, font=self.f(14, "bold"),
                                  command=lambda: self._show_page("settings"))
         self.cog.pack(fill="x", padx=14, pady=3)
+        sc = ctk.ScalingTracker.get_widget_scaling(side)
+        self._marker_h = int(22 * sc)
+        self._marker = tk.Frame(side, bg=ACCENT, width=max(3, int(4 * sc)), height=self._marker_h,
+                                highlightthickness=0, bd=0)
+        self._marker_y = None
 
         bottom = ctk.CTkFrame(side, fg_color="transparent")
         bottom.pack(side="bottom", fill="x", padx=14, pady=18)
@@ -1237,6 +1243,7 @@ class App:
 
         # ---- pages
         main = ctk.CTkFrame(r, fg_color=BG, corner_radius=0)
+        self._main = main
         main.grid(row=0, column=1, sticky="nsew")
         main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=1)
@@ -1252,6 +1259,10 @@ class App:
         prev = getattr(self, "_page", None)
         self._page = key
         page = self.pages_ui[key]
+        animate = prev is not None and prev != key and not force and self.anim_on.get()
+        if animate:
+            self._fade_in_page()        # cover the page area, then fade the cover away
+        self.root.after_idle(lambda: self._move_marker(key, animate))
         # bring the page to the front: nothing is laid out or redrawn again (hiding and
         # re-showing pages made Tk redo every widget on them - that was the lag)
         getattr(page, "_parent_frame", page).tkraise()
@@ -1264,6 +1275,72 @@ class App:
                                    image=self._gear["on" if on else "off"])
         if key == "market" and time.time() - self.market_at > 60:
             self._market_refresh()
+
+    # ------------------------------------------------------------ animations
+    def _animate(self, name, ms, step, done=None):
+        """Run step(t) with t going 0 -> 1 over `ms` milliseconds (~60 fps), eased out.
+        Starting the same animation again replaces the running one."""
+        jobs = self.__dict__.setdefault("_anim_jobs", {})
+        if jobs.get(name):
+            self.root.after_cancel(jobs[name])
+        t0 = time.perf_counter()
+
+        def tick():
+            t = min(1.0, (time.perf_counter() - t0) * 1000 / ms)
+            step(1 - (1 - t) ** 3)                     # ease-out cubic
+            if t < 1.0:
+                jobs[name] = self.root.after(15, tick)
+            else:
+                jobs[name] = None
+                if done:
+                    done()
+        tick()
+
+    def _move_marker(self, key, animate):
+        btn = self.nav.get(key) or (self.cog if key == "settings" else None)
+        if btn is None or not btn.winfo_ismapped():
+            return
+        target = btn.winfo_y() + (btn.winfo_height() - self._marker_h) // 2
+        x = btn.winfo_x() + max(2, btn.winfo_height() // 10)
+        start = self._marker_y
+        if start is None or not animate:
+            self._marker_y = target
+            self._marker.place(x=x, y=target)
+            self._marker.lift()
+            return
+
+        def step(t):
+            self._marker_y = int(start + (target - start) * t)
+            self._marker.place(x=x, y=self._marker_y)
+        self._marker.lift()
+        self._animate("marker", 180, step)
+
+    def _fade_in_page(self):
+        """A borderless, click-through layer in the page colour sits over the page area and
+        fades out - the new page appears to fade in. Windows does the fading, so it's cheap."""
+        if self.root.state() != "normal":
+            return
+        f = getattr(self, "_fade", None)
+        if f is None:
+            f = self._fade = tk.Toplevel(self.root)
+            f.overrideredirect(True)
+            f.withdraw()
+            f.update_idletasks()
+            hwnd = user32.GetParent(f.winfo_id())
+            ex = user32.GetWindowLongW(hwnd, -20)
+            # layered | click-through | toolwindow | never takes focus
+            user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80 | 0x08000000)
+        m = self._main
+        f.configure(bg=BG)
+        f.geometry(f"{m.winfo_width()}x{m.winfo_height()}+{m.winfo_rootx()}+{m.winfo_rooty()}")
+        f.attributes("-topmost", bool(self.on_top.get()))
+        f.attributes("-alpha", 0.92)
+        f.deiconify()
+        f.lift(self.root)
+
+        def step(t):
+            f.attributes("-alpha", 0.92 * (1 - t))
+        self._animate("fade", 170, step, done=f.withdraw)
 
     def _page_title(self, parent, title, subtitle):
         h = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2574,6 +2651,9 @@ class App:
         for ev in ("<Button-1>", "<B1-Motion>"):
             self.strip.bind(ev, self._strip_drag)
         self.strip.bind("<ButtonRelease-1>", lambda e: self._strip_drag(e, final=True))
+        ctk.CTkSwitch(ac, text="Animations (page fade, sliding menu marker)", variable=self.anim_on,
+                      progress_color=ACCENT, font=self.f(13), text_color=FG,
+                      command=self._save).pack(anchor="w", padx=18, pady=(0, 16))
         self._mark_accent()
 
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
@@ -2891,7 +2971,7 @@ class App:
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
                 "beep": self.beep, "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
-                "minibar": self.minibar_on}
+                "minibar": self.minibar_on, "animations": self.anim_on}
 
     def _save(self):
         cfg = {}
