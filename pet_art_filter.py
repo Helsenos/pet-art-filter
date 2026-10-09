@@ -757,14 +757,11 @@ def save_dataset(img, cx, box, name, arts):
 
 # ================================================================ overlay
 class GameLayer:
-    """Keeps the glow layer and the mini bar directly above the game window in the
-    window stack (instead of always-on-top): programs you put over the game also
-    cover the glows, and a minimized game takes them along.
+    """Knows which window is the game, so the glows and the mini bar can hide while
+    another program covers it (or the game is minimized).
     The game is recognised by its program (.exe): learned from the window under the
     mouse whenever a pet art was read successfully - that window can only be the game."""
-    GW_HWNDNEXT, GW_HWNDPREV = 2, 3
-    HWND_TOP, HWND_BOTTOM = 0, 1
-    SWP_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200 | 0x0400   # no size/move/activate/owner/changing
+    GW_HWNDNEXT = 2
 
     def __init__(self, exe=None):
         self.exe = exe          # e.g. "metin2client.exe" (saved in the config)
@@ -772,6 +769,7 @@ class GameLayer:
         self._names = {}
         user32.GetWindow.restype = wt.HWND
         user32.GetTopWindow.restype = wt.HWND
+        user32.GetForegroundWindow.restype = wt.HWND
 
     def _exe_of(self, h):
         if h in self._names:
@@ -848,28 +846,23 @@ class GameLayer:
             h = user32.GetWindow(h, self.GW_HWNDNEXT)
         self.game = fallback
 
-    def place(self, layers, ours):
-        """layers: our windows, bottom first. Returns False when the game isn't known."""
+    def covered(self, areas, ours):
+        """True when the glows shouldn't show: the game is minimized, or another program
+        is the active window and lies over the inventory / stash. (The game runs as
+        administrator, so Windows only lets always-on-top windows show over it - the
+        glows stay on top and simply hide while something else covers the game.)"""
         g = self.game
         if not g or not user32.IsWindow(g):
             return False
-        if user32.IsIconic(g):          # minimized game: glows go to the very back
-            for h in layers:
-                user32.SetWindowPos(h, self.HWND_BOTTOM, 0, 0, 0, 0, self.SWP_FLAGS)
+        if user32.IsIconic(g):
             return True
-        below = user32.GetWindow(layers[0], self.GW_HWNDNEXT)
-        while below and below in ours:
-            below = user32.GetWindow(below, self.GW_HWNDNEXT)
-        if below == g:                   # already right above the game: nothing to do
-            return True
-        above = user32.GetWindow(g, self.GW_HWNDPREV)
-        while above and above in ours:
-            above = user32.GetWindow(above, self.GW_HWNDPREV)
-        topmost = above and user32.GetWindowLongW(above, -20) & 0x8
-        after = self.HWND_TOP if not above or topmost else above
-        for h in layers:                 # each goes right below `after`: the last one ends up on top
-            user32.SetWindowPos(h, after, 0, 0, 0, 0, self.SWP_FLAGS)
-        return True
+        fg = user32.GetForegroundWindow()
+        if not fg or fg == g or fg in ours or self._exe_of(fg) in (None, self.exe):
+            return False             # the game, Pet Art Filter itself, or something we can't tell
+        r = wt.RECT()
+        if not user32.GetWindowRect(fg, ctypes.byref(r)) or user32.IsIconic(fg):
+            return False
+        return any(r.left < x1 and x0 < r.right and r.top < y1 and y0 < r.bottom for x0, y0, x1, y1 in areas)
 
 
 class Overlay:
@@ -894,6 +887,7 @@ class Overlay:
         self.set_capture_mode(True)
         self.pulse = False
         self.phase = 0.0
+        self.covered = False     # True while another program covers the game: draw nothing
         self.ticks = 0
         self.flash_slot = None
         self.state = ([], {}, False, False)
@@ -917,6 +911,8 @@ class Overlay:
             self.pulse = not self.pulse
         try:
             self.redraw()
+            if self.ticks % 15 == 0 and not getattr(self, "covered", False):
+                self.win.attributes("-topmost", True)      # stay above the game (it runs as admin)
         except tk.TclError:
             return
         self.win.after(60, self._tick)
@@ -942,6 +938,8 @@ class Overlay:
         grids, marks, show_grid, show_scanned = self.state
         cv = self.cv
         cv.delete("all")
+        if getattr(self, "covered", False):      # another program is over the game
+            return
         ox, oy = self.vx, self.vy
         if show_grid:
             for g in grids:
@@ -1059,6 +1057,7 @@ class MiniBar:
     def show(self, on):
         if on:
             self.win.deiconify()
+            self.win.attributes("-topmost", True)
         else:
             self.win.withdraw()
 
@@ -1225,7 +1224,7 @@ class App:
         self.overlay = Overlay(root)
         self.minibar = MiniBar(self)
         self.game_layer = GameLayer(self._game_exe)
-        self._layers_topmost = True
+        self._covered = False
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
         self.minibar.set_capture_mode(not self._rec_on)
@@ -1458,24 +1457,27 @@ class App:
         self._animate("fade", 170, step, done=f.withdraw)
 
     def _keep_layers_above_game(self):
-        """Glows + mini bar sit right above the game window. Until the game is known they
-        stay always-on-top (the old behaviour) so they're never hidden by mistake."""
+        """Glows + mini bar stay always-on-top (the only way to show over the game), but
+        hide while another program is active over the inventory / stash."""
         try:
-            ours = {self.overlay.hwnd, self.minibar.hwnd, user32.GetParent(self.root.winfo_id())}
-            fade = getattr(self, "_fade", None)
-            if fade is not None:
-                ours.add(user32.GetParent(fade.winfo_id()))
-            g = self.grids[0] if self.grids else None
-            point = (g["x"] + g["w"] / 2, g["y"] + g["h"] / 2) if g else None
             if self._tick % 30 == 0:           # ~once a second: find the game window again if needed
-                self.game_layer.track(point)
-            known = self.game_layer.game is not None
-            if known == self._layers_topmost:      # switch between the two modes
-                self._layers_topmost = not known
-                self.overlay.win.attributes("-topmost", not known)
-                self.minibar.win.attributes("-topmost", not known)
-            if known:
-                self.game_layer.place([self.overlay.hwnd, self.minibar.hwnd], ours)
+                g = self.grids[0] if self.grids else None
+                self.game_layer.track((g["x"] + g["w"] / 2, g["y"] + g["h"] / 2) if g else None)
+            if self._tick % 3:                 # ~10x a second is plenty
+                return
+            ours = {self.overlay.hwnd, self.minibar.hwnd, user32.GetParent(self.root.winfo_id())}
+            areas = [(g["x"], g["y"], g["x"] + g["w"], g["y"] + g["h"]) for g in self.grids]
+            if self.minibar_on.get():
+                mb = self.minibar.win
+                areas.append((mb.winfo_rootx(), mb.winfo_rooty(),
+                              mb.winfo_rootx() + mb.winfo_width(), mb.winfo_rooty() + mb.winfo_height()))
+            covered = self.game_layer.covered(areas, ours)
+            if covered != self._covered:
+                self._covered = covered
+                self.overlay.covered = covered
+                self.overlay.redraw()
+                if self.minibar_on.get():
+                    self.minibar.show(not covered)
         except Exception:
             pass
 
