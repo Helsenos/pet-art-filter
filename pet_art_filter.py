@@ -621,6 +621,18 @@ class Scanner(threading.Thread):
 
     seq = 0        # numbers keep counting across scans (old numbers stay unique)
 
+    def _looks_empty(self, sct, slot):
+        """An empty slot is plain dark background: dim and even. Item icons - even the hollow
+        steel collar - have bright parts. Unsure = not empty (it keeps its "hover again" dot)."""
+        try:
+            x0, y0, x1, y1 = slot_rect(self.grids[slot[0]], slot[2], slot[3])
+            g = sct.grab({"left": int(x0) + 3, "top": int(y0) + 3,
+                          "width": max(4, int(x1 - x0) - 6), "height": max(4, int(y1 - y0) - 6)})
+            a = np.asarray(g)[:, :, :3].mean(2)
+            return np.percentile(a, 95) < 32 and a.std() < 15
+        except Exception:
+            return False
+
     def run(self):
         while not self.stop_evt.is_set():
             try:
@@ -639,8 +651,8 @@ class Scanner(threading.Thread):
                     slot = (slot[0], self.pages.get(slot[0], 0), slot[1], slot[2])
                 now = time.perf_counter()
                 if slot != cur:
-                    if cur is not None and not grabbed:
-                        self.event_q.put(("missed", cur))
+                    if cur is not None and not grabbed:      # passed too quickly to read it
+                        self.event_q.put(("empty" if self._looks_empty(sct, cur) else "missed", cur))
                     cur, entered, grabbed = slot, now, False
                 elif cur is not None and not grabbed and now - entered >= self.delay:
                     gi, pg, r, c = cur
@@ -3935,6 +3947,10 @@ class App:
                 break
             if kind == "missed" and self.marks.get(slot) not in ("good", "bad"):
                 self.marks[slot] = "missed"
+                changed = True
+            elif kind == "empty" and self.marks.get(slot) == "missed":     # nothing there (any more)
+                self.marks.pop(slot)
+                self.icons.pop(slot, None)
                 changed = True
             elif kind == "page":
                 changed = True
