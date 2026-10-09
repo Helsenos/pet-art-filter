@@ -25,9 +25,7 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Much faster app: page switching 3x faster, presets react instantly, smoother scrolling
-- Page animations: pages fade in and a marker slides along the menu (can be turned off in Settings)
-- Uses almost no CPU when you're not scanning
+NOTES = """- Glows hide while another program (Discord, browser...) is over the game or the game is minimized, and come back when you return to the game
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
