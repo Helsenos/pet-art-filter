@@ -131,7 +131,10 @@ MAX_PICTURE = 40000
 def listing_picture(listing_id):
     """-> WebP bytes of a listing's tooltip picture, or None."""
     data = _rpc("listing_picture", p_id=listing_id)
-    if not isinstance(data, str) or len(data) > MAX_PICTURE * 4 // 3 + 8:
+    if not isinstance(data, str) or len(data) > MAX_PICTURE * 2:
+        return None
+    data = "".join(data.split())          # Postgres wraps base64 every 76 characters
+    if len(data) > MAX_PICTURE * 4 // 3 + 8:
         return None
     try:
         return base64.b64decode(data, validate=True)

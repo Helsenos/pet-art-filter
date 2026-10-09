@@ -2030,6 +2030,7 @@ class App:
                                 border_color=BORDER)
             card.pack(fill="x", padx=8, pady=5)
             card.grid_columnconfigure(1, weight=1)
+            card.grid_columnconfigure(0, minsize=int(190 * ctk.ScalingTracker.get_widget_scaling(card)))  # pictures line up
             left = ctk.CTkFrame(card, fg_color="transparent")
             left.grid(row=0, column=0, sticky="nw", padx=16, pady=12)
             ctk.CTkLabel(left, text=r.get("item", "?"), font=self.f(15, "bold"), text_color=MUST_COL,
