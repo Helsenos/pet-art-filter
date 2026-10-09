@@ -459,7 +459,8 @@ class Scanner(threading.Thread):
 
     def __init__(self, grids, pages, icons, marks, cap, delay_ms, ocr_q, event_q, hide_overlay=None):
         super().__init__(daemon=True)
-        self.hide_overlay = hide_overlay   # (hwnd, is_on) in screen-recording mode
+        self.hide_overlay = hide_overlay   # ((hwnds), is_on) in screen-recording mode
+        self._hidden = []
         self.grids, self.pages, self.icons, self.marks, self.cap = grids, pages, icons, marks, cap
         self.delay = delay_ms / 1000.0
         self.ocr_q, self.event_q = ocr_q, event_q
@@ -468,6 +469,11 @@ class Scanner(threading.Thread):
 
     def stop(self):
         self.stop_evt.set()
+
+    def _show_overlay(self):
+        for hw in self._hidden:
+            user32.ShowWindowAsync(hw, 8)   # SW_SHOWNA: back, no focus change
+        self._hidden = []
 
     def run(self):
         vx, vy, vw, vh = virtual_screen()
@@ -494,7 +500,9 @@ class Scanner(threading.Thread):
                     grabbed = True
                     hide = self.hide_overlay and self.hide_overlay[1]()
                     if hide:   # recording mode: take the glow off the screen for one frame
-                        user32.ShowWindowAsync(self.hide_overlay[0], 0)
+                        self._hidden = [hw for hw in self.hide_overlay[0] if user32.IsWindowVisible(hw)]
+                        for hw in self._hidden:
+                            user32.ShowWindowAsync(hw, 0)
                         dwmapi.DwmFlush()
                         dwmapi.DwmFlush()
                     # Already read this slot and the item icon still looks the same?
@@ -509,7 +517,7 @@ class Scanner(threading.Thread):
                         sum(ImageStat.Stat(ImageChops.difference(old, icon)).mean) / 3 < 8
                     if same_item and self.marks.get(cur) in ("good", "bad"):
                         if hide:
-                            user32.ShowWindowAsync(self.hide_overlay[0], 8)
+                            self._show_overlay()
                         time.sleep(0.004)
                         continue   # same pet art, already fully read
                     self.icons[cur] = icon
@@ -522,7 +530,7 @@ class Scanner(threading.Thread):
                                      "width": right - left, "height": bottom - top})
                     img = Image.frombytes("RGB", shot.size, shot.rgb)
                     if hide:
-                        user32.ShowWindowAsync(self.hide_overlay[0], 8)   # SW_SHOWNA: back, no focus change
+                        self._show_overlay()
                     self.seq += 1
                     self.ocr_q.put((self.seq, cur, img, cx - left, same_item))
                     self.event_q.put(("grabbed", cur))
@@ -793,6 +801,158 @@ class Overlay:
                 cv.create_rectangle(x0 - ox - 6, y0 - oy - 6, x1 - ox + 6, y1 - oy + 6, outline=col, width=4)
 
 
+# ================================================================ in-game mini bar
+def find_game_window():
+    """The Metin2 client window (title like "Nihor2 - Chronicles of Jinteia")."""
+    found = []
+    EnumProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    me = os.getpid()
+
+    def cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == me:
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        t = buf.value.lower()
+        if "jinteia" in t or "metin2" in t or "metin 2" in t:
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(EnumProc(cb), 0)
+    return found[0] if found else None
+
+
+class MiniBar:
+    """Small bar that sits on the game screen next to the game's own icons:
+    start/stop, clear marks, good count, open the app. Clicking it doesn't take the
+    keyboard away from the game. Drag it by the grip; the spot is remembered relative
+    to the game window's bottom-right corner."""
+
+    KEY = "#010204"
+
+    def __init__(self, app):
+        self.app = app
+        self.game = None
+        self.offset = tuple(app.minibar_offset) if app.minibar_offset else None
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg=self.KEY)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-transparentcolor", self.KEY)
+        bar = ctk.CTkFrame(self.win, corner_radius=19, fg_color="#14161c", bg_color=self.KEY, border_width=1,
+                           border_color="#8a7650")
+        bar.pack()
+        f = lambda size, w="bold": ctk.CTkFont(family="Segoe UI", size=size, weight=w)  # noqa: E731
+        rb = dict(width=30, height=30, corner_radius=15, border_width=1, border_color="#5d5038",
+                  font=f(13), text_color=FG)
+        self.go = ctk.CTkButton(bar, text="▶", fg_color=ACCENT, hover_color=ACCENT_H,
+                                command=app._toggle, **rb)
+        self.go.pack(side="left", padx=(5, 3), pady=4)
+        ctk.CTkButton(bar, text="✕", fg_color=CARD2, hover_color=BORDER, command=app._clear_marks,
+                      **rb).pack(side="left", padx=3, pady=4)
+        self.count = ctk.CTkLabel(bar, text="✦ 0", font=f(13), text_color=GOOD, width=44)
+        self.count.pack(side="left", padx=(4, 2))
+        ctk.CTkButton(bar, text="◆", fg_color=CARD2, hover_color=BORDER, command=self._open_app,
+                      **rb).pack(side="left", padx=3, pady=4)
+        grip = ctk.CTkLabel(bar, text="⣿", font=f(14, "normal"), text_color=MUTED, width=16, cursor="fleur")
+        grip.pack(side="left", padx=(2, 8))
+        grip.bind("<ButtonPress-1>", self._drag_start)
+        grip.bind("<B1-Motion>", self._drag_move)
+        grip.bind("<ButtonRelease-1>", self._drag_end)
+        self.win.update_idletasks()
+        self.hwnd = user32.GetParent(self.win.winfo_id())
+        ex = user32.GetWindowLongW(self.hwnd, -20)
+        # no-activate (game keeps the keyboard) | toolwindow (no taskbar button)
+        user32.SetWindowLongW(self.hwnd, -20, ex | 0x08000000 | 0x80)
+        self.shown = True
+        self._drag = None
+        self.win.withdraw()
+        self.shown = False
+        self._follow()
+
+    def set_capture_mode(self, hide_from_capture):
+        try:
+            user32.SetWindowDisplayAffinity(self.hwnd, 0x11 if hide_from_capture else 0)
+        except Exception:
+            pass
+
+    def update(self, scanning, good):
+        self.go.configure(text="■" if scanning else "▶", fg_color=BAD if scanning else ACCENT,
+                          hover_color="#e25c5c" if scanning else ACCENT_H)
+        self.count.configure(text=f"✦ {good}")
+
+    def _open_app(self):
+        r = self.app.root
+        r.deiconify()
+        r.lift()
+        r.focus_force()
+
+    def _game_corner(self):
+        """Bottom-right corner of the game's picture area in screen pixels, or None."""
+        if not self.game or not user32.IsWindow(self.game):
+            self.game = find_game_window()
+        if not self.game or user32.IsIconic(self.game):
+            return None
+        rc = wt.RECT()
+        user32.GetClientRect(self.game, ctypes.byref(rc))
+        pt = wt.POINT(rc.right, rc.bottom)
+        user32.ClientToScreen(self.game, ctypes.byref(pt))
+        return pt.x, pt.y
+
+    def _follow(self):
+        try:
+            self._place()
+        except tk.TclError:
+            return
+        except Exception:
+            pass
+        self.win.after(400, self._follow)
+
+    def _place(self):
+        if self._drag:
+            return
+        want = self.app.minibar_on.get()
+        corner = self._game_corner() if want else None
+        fg = user32.GetForegroundWindow()
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+        ours_or_game = fg == self.game or pid.value == os.getpid()
+        if corner is None or not ours_or_game:
+            if self.shown:
+                self.win.withdraw()
+                self.shown = False
+            return
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        if self.offset is None:     # default: just left of the game's icon row, bottom right
+            self.offset = (-352 - w, -h - 1)
+        x, y = corner[0] + self.offset[0], corner[1] + self.offset[1]
+        self.win.geometry(f"+{int(x)}+{int(y)}")
+        if not self.shown:
+            self.win.deiconify()
+            self.shown = True
+        self.win.attributes("-topmost", True)
+
+    def _drag_start(self, e):
+        self._drag = (e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y())
+
+    def _drag_move(self, e):
+        if self._drag:
+            self.win.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
+
+    def _drag_end(self, e):
+        self._drag = None
+        corner = self._game_corner()
+        if corner:
+            self.offset = (self.win.winfo_x() - corner[0], self.win.winfo_y() - corner[1])
+            self.app.minibar_offset = list(self.offset)
+            self.app._save()
+
+
 # ================================================================ click picker
 def pick_point(root, prompt, callback):
     """Full-screen see-through layer: one click -> callback((x, y)) in screen pixels,
@@ -902,6 +1062,8 @@ class App:
         self.only_good = tk.BooleanVar(value=False)
         self.on_top = tk.BooleanVar(value=False)
         self.rec_mode = tk.BooleanVar(value=False)    # screen-recording friendly
+        self.minibar_on = tk.BooleanVar(value=True)   # small bar on the game screen
+        self.minibar_offset = None
         self.market_match = tk.BooleanVar(value=False)
         self.seller = ""
         self.contact = ""
@@ -910,8 +1072,10 @@ class App:
         self._build()
         self._load()
         self.overlay = Overlay(root)
+        self.minibar = MiniBar(self)
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
+        self.minibar.set_capture_mode(not self._rec_on)
         self._refresh_overlay()
 
         self.reader = font_reader.FontReader(
@@ -1157,6 +1321,8 @@ class App:
         self.hero.configure(border_color=BORDER if color == MUTED else color)
 
     def _set_scanning(self, on):
+        if hasattr(self, "minibar"):
+            self.minibar.update(on, list(self.marks.values()).count("good"))
         if on:
             self.scan_btn.configure(text="■   Stop scanning", fg_color=BAD, hover_color="#e25c5c")
             self._set_verdict("Scanning…", ACCENT, "Hover your pet arts – good ones glow in the game")
@@ -1166,6 +1332,8 @@ class App:
 
     def _update_stats(self):
         marks = list(self.marks.values())
+        if hasattr(self, "minibar"):
+            self.minibar.update(bool(self.scanner), marks.count("good"))
         self.tiles["scanned"].configure(text=str(len(self.hist_slots)))
         self.tiles["good"].configure(text=str(marks.count("good")))
         self.tiles["inc"].configure(text=str(marks.count("incomplete")))
@@ -1954,6 +2122,14 @@ class App:
         ctk.CTkSwitch(rc, text="Screen-recording friendly", variable=self.rec_mode, progress_color=ACCENT,
                       font=self.f(13), text_color=FG, command=self._set_rec_mode).pack(anchor="w", padx=18, pady=(4, 16))
 
+        mb = self._card(pg, "In-game mini bar", "A small bar on the game screen next to the game’s icons: "
+                        "▶ start/stop, ✕ clear marks, ✦ good count, ◆ open this window. Drag "
+                        "it by ⣿ to move it. It only shows while the game is in front.")
+        mb.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkSwitch(mb, text="Show the mini bar on the game screen", variable=self.minibar_on,
+                      progress_color=ACCENT, font=self.f(13), text_color=FG, command=self._save
+                      ).pack(anchor="w", padx=18, pady=(4, 16))
+
         lc = self._card(pg, "Font memory", "The app learns your game’s font while you hover. "
                         "New words are read once by the slower teacher, then recognised instantly.")
         lc.pack(fill="x", padx=28, pady=(0, 16))
@@ -1989,6 +2165,7 @@ class App:
             if key in cfg:
                 var.set(cfg[key])
         self.grids = cfg.get("grids", [])
+        self.minibar_offset = cfg.get("minibar_offset")
         self.official = cfg.get("official_cache", [])
         self.official_on = cfg.get("official_on", {})
         self.seller, self.contact = cfg.get("seller", ""), cfg.get("contact", "")
@@ -2017,7 +2194,8 @@ class App:
         return {"min_matches": self.min_matches, "delay_ms": self.delay_ms,
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
-                "beep": self.beep, "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode}
+                "beep": self.beep, "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
+                "minibar": self.minibar_on}
 
     def _save(self):
         cfg = {}
@@ -2029,6 +2207,7 @@ class App:
         cfg["grids"] = self.grids
         cfg["bonuses"] = {n: {"mode": m.get(), "min": self._int(v, BONUSES[n][0])}
                           for n, (m, v) in self.vars.items()}
+        cfg["minibar_offset"] = self.minibar_offset
         cfg["profiles"] = self.profiles
         cfg["current"] = self.current
         cfg["official_on"] = self.official_on
@@ -2225,6 +2404,7 @@ class App:
     def _set_rec_mode(self):
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
+        self.minibar.set_capture_mode(not self._rec_on)
         self._save()
         self._set_status("Screen recording allowed – the glow blinks briefly when a tooltip is read."
                          if self._rec_on else "Glow hidden from screenshots again (best reading).", ACCENT)
@@ -2249,7 +2429,8 @@ class App:
         cap = {"width": self._int(self.cap_width, 480), "above": self._int(self.cap_above, 520),
                "below": self._int(self.cap_below, 480)}
         self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, self._int(self.delay_ms, 60),
-                               self.ocr_q, self.event_q, hide_overlay=(self.overlay.hwnd, lambda: self._rec_on))
+                               self.ocr_q, self.event_q,
+                               hide_overlay=((self.overlay.hwnd, self.minibar.hwnd), lambda: self._rec_on))
         self.scanner.start()
         self._set_scanning(True)
 
