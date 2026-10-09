@@ -846,29 +846,32 @@ class GameLayer:
             h = user32.GetWindow(h, self.GW_HWNDNEXT)
         self.game = fallback
 
-    def covered(self, areas, layers):
-        """True when the glows shouldn't show: the game is minimized, or another program
-        is the active window and lies over the inventory / stash. (The game runs as
-        administrator, so Windows only lets always-on-top windows show over it - the
-        glows stay on top and simply hide while something else covers the game.)"""
+    def cover(self, areas, layers):
+        """What hides the glows: None (nothing), "all" (game minimized) or the screen
+        rectangle of the active window when it lies over the inventory / stash - glows are
+        then cut out only there. (The game runs as administrator, so Windows only lets
+        always-on-top windows show over it: the glows stay on top and leave a hole where
+        another window covers the game.)"""
         g = self.game
         if not g or not user32.IsWindow(g):
-            return False
+            return None
         if user32.IsIconic(g):
-            return True
+            return "all"
         fg = user32.GetForegroundWindow()
         if not fg or fg == g or fg in layers:
-            return False             # the game itself, or our own glow layer / mini bar
+            return None              # the game itself, or our own glow layer / mini bar
         pid = wt.DWORD()
         user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
         if pid.value != os.getpid() and self._exe_of(fg) in (None, self.exe):
-            return False             # another window of the game, or something we can't tell
+            return None              # another window of the game, or something we can't tell
         # any other program - Pet Art Filter's own window and dialogs included - covers the
         # glows when it lies over the inventory / stash
         r = wt.RECT()
         if not user32.GetWindowRect(fg, ctypes.byref(r)) or user32.IsIconic(fg):
-            return False
-        return any(r.left < x1 and x0 < r.right and r.top < y1 and y0 < r.bottom for x0, y0, x1, y1 in areas)
+            return None
+        if any(r.left < x1 and x0 < r.right and r.top < y1 and y0 < r.bottom for x0, y0, x1, y1 in areas):
+            return (r.left, r.top, r.right, r.bottom)
+        return None
 
 
 class Overlay:
@@ -893,7 +896,7 @@ class Overlay:
         self.set_capture_mode(True)
         self.pulse = False
         self.phase = 0.0
-        self.covered = False     # True while another program covers the game: draw nothing
+        self.cover = None        # "all" or (l, t, r, b) of a window over the game: no glows there
         self.ticks = 0
         self.flash_slot = None
         self.state = ([], {}, False, False)
@@ -917,7 +920,7 @@ class Overlay:
             self.pulse = not self.pulse
         try:
             self.redraw()
-            if self.ticks % 15 == 0 and not getattr(self, "covered", False):
+            if self.ticks % 15 == 0 and self.cover != "all":
                 self.win.attributes("-topmost", True)      # stay above the game (it runs as admin)
         except tk.TclError:
             return
@@ -944,7 +947,7 @@ class Overlay:
         grids, marks, show_grid, show_scanned = self.state
         cv = self.cv
         cv.delete("all")
-        if getattr(self, "covered", False):      # another program is over the game
+        if self.cover == "all":                  # game minimized
             return
         ox, oy = self.vx, self.vy
         if show_grid:
@@ -1001,6 +1004,9 @@ class Overlay:
             else:
                 x0, y0, x1, y1 = slot_rect(g, r, c)
                 cv.create_rectangle(x0 - ox - 6, y0 - oy - 6, x1 - ox + 6, y1 - oy + 6, outline=col, width=4)
+        if self.cover:       # a window lies over the game: cut the glows out exactly there
+            l, t, r_, b = self.cover
+            cv.create_rectangle(l - ox, t - oy, r_ - ox, b - oy, fill=KEY_COLOR, outline=KEY_COLOR, width=0)
 
 
 # ================================================================ in-game mini bar
@@ -1230,7 +1236,7 @@ class App:
         self.overlay = Overlay(root)
         self.minibar = MiniBar(self)
         self.game_layer = GameLayer(self._game_exe)
-        self._covered = False
+        self._cover = None
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
         self.minibar.set_capture_mode(not self._rec_on)
@@ -1480,13 +1486,20 @@ class App:
                 mb = self.minibar.win
                 areas.append((mb.winfo_rootx(), mb.winfo_rooty(),
                               mb.winfo_rootx() + mb.winfo_width(), mb.winfo_rooty() + mb.winfo_height()))
-            covered = self.game_layer.covered(areas, layers)
-            if covered != self._covered:
-                self._covered = covered
-                self.overlay.covered = covered
+            cover = self.game_layer.cover(areas, layers)
+            if cover != self._cover:
+                self._cover = cover
+                self.overlay.cover = cover
                 self.overlay.redraw()
                 if self.minibar_on.get():
-                    self.minibar.show(not covered)
+                    mb = self.minibar.win
+                    mx0, my0 = mb.winfo_rootx(), mb.winfo_rooty()
+                    hidden = cover == "all" or (cover is not None and cover[0] < mx0 + mb.winfo_width()
+                                                and mx0 < cover[2] and cover[1] < my0 + mb.winfo_height()
+                                                and my0 < cover[3])
+                    if hidden != getattr(self, "_minibar_hidden", False):
+                        self._minibar_hidden = hidden
+                        self.minibar.show(not hidden)
         except Exception:
             pass
 
