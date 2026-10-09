@@ -94,22 +94,68 @@ def market(limit=300):
                                                     "limit": str(limit)}) or []
 
 
-def my_listings(owner_key):
-    return _rpc("my_listings", p_secret=owner_key) or []
+# selling is invite-only: the admin creates sellers, each gets a private seller code
+CODE_CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"     # no 0/O or 1/I mix-ups
 
 
-def add_listing(owner_key, seller, contact, item, bonuses, price_kk, version):
-    """bonuses: [(name, value), ...]"""
-    return _rpc("add_listing", p_secret=owner_key, p_seller=seller, p_contact=contact, p_item=item,
+def new_seller_code():
+    """e.g. PAF-7K2M-Q9XD-4HTB-R8WN (80 random bits)."""
+    raw = "".join(secrets.choice(CODE_CHARS) for _ in range(16))
+    return "PAF-" + "-".join(raw[i:i + 4] for i in range(0, 16, 4))
+
+
+def seller_check(code):
+    """-> {"name", "active"} for a valid seller code, else None."""
+    rows = _rpc("seller_check", p_code=code) or []
+    return rows[0] if rows else None
+
+
+def my_listings(code):
+    return _rpc("my_listings", p_secret=code) or []
+
+
+def add_listing(code, contact, item, bonuses, price_kk, version):
+    """bonuses: [(name, value), ...]. The seller name comes from the seller account."""
+    return _rpc("add_listing", p_code=code, p_contact=contact, p_item=item,
                 p_bonuses=[[b, v] for b, v in bonuses], p_price=price_kk, p_version=version)
 
 
-def remove_listing(owner_key, listing_id):
-    return _rpc("remove_listing", p_secret=owner_key, p_id=listing_id)
+def remove_listing(code, listing_id):
+    return _rpc("remove_listing", p_secret=code, p_id=listing_id)
 
 
-def mark_sold(owner_key, listing_id):
-    return _rpc("mark_sold", p_secret=owner_key, p_id=listing_id)
+def mark_sold(code, listing_id):
+    return _rpc("mark_sold", p_secret=code, p_id=listing_id)
+
+
+# ---------------------------------------------------------------- sellers (admin)
+def admin_create_seller(admin_key, name):
+    """-> the new seller's code (shown once - only its hash is stored online)."""
+    code = new_seller_code()
+    _rpc("admin_create_seller", p_secret=admin_key, p_name=name, p_code=code)
+    return code
+
+
+def admin_sellers(admin_key):
+    return _rpc("admin_sellers", p_secret=admin_key) or []
+
+
+def admin_set_seller_active(admin_key, seller_id, active):
+    return _rpc("admin_set_seller_active", p_secret=admin_key, p_id=seller_id, p_active=bool(active))
+
+
+def admin_new_seller_code(admin_key, seller_id):
+    code = new_seller_code()
+    _rpc("admin_new_seller_code", p_secret=admin_key, p_id=seller_id, p_code=code)
+    return code
+
+
+def admin_delete_seller(admin_key, seller_id):
+    return _rpc("admin_delete_seller", p_secret=admin_key, p_id=seller_id)
+
+
+def admin_remove_listing(admin_key, listing_id):
+    return _rpc("admin_remove_listing", p_secret=admin_key, p_id=listing_id)
 
 
 # ---------------------------------------------------------------- official presets

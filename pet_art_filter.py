@@ -1094,7 +1094,9 @@ class App:
         self.official_on = {}  # official preset id -> on/off for me
         self.current = None    # preset shown in the editor
         self.net_q = queue.Queue()
-        self.owner_key = None
+        self.seller_code = cloud.load_key(os.path.join(APP_DIR, "seller.key"), create=False)
+        self.seller_name = ""        # name of the seller account the code belongs to
+        self.sellers = []            # admin: all seller accounts
         self.admin_key = cloud.load_key(os.path.join(APP_DIR, "admin.key"), create=False)
         self.market_rows, self.market_mine, self.market_at = [], [], 0.0
         self._last_official = 0.0
@@ -1809,6 +1811,9 @@ class App:
         self.market_search.bind("<KeyRelease>", lambda e: self._render_market())
         self.market_info = ctk.CTkLabel(pg, text="", font=self.f(12), text_color=MUTED, anchor="w")
         self.market_info.pack(fill="x", padx=30)
+        self.seller_line = ctk.CTkFrame(pg, fg_color="transparent")
+        self.seller_line.pack(fill="x", padx=30, pady=(2, 0))
+        self._render_seller_line()
         self.market_list = ctk.CTkScrollableFrame(pg, fg_color=BG, corner_radius=0,
                                                   scrollbar_button_color=CARD2, scrollbar_button_hover_color=BORDER)
         self.market_list.pack(fill="both", expand=True, padx=20, pady=(4, 20))
@@ -1822,15 +1827,116 @@ class App:
         self.market_info.configure(text="Loading…", text_color=MUTED)
         mine = self.market_view.get() == "My listings"
         if mine:
-            key = self._owner()
+            key = self.seller_code
+            if not key:
+                self.market_mine = []
+                self._render_market()
+                return
             self._bg(lambda: self.net_q.put(("mine", cloud.my_listings(key))))
         else:
             self._bg(lambda: self.net_q.put(("market", cloud.market())))
 
-    def _owner(self):
-        if not self.owner_key:
-            self.owner_key = cloud.load_key(os.path.join(APP_DIR, "market_owner.key"))
-        return self.owner_key
+    # ------------------------------------------------------------ seller code (invite-only selling)
+    def _seller_code_dialog(self, then=None):
+        """Ask for the seller code the admin gave this player; checked online before it's saved."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("Seller code")
+        win.configure(fg_color=BG)
+        win.geometry("440x300")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        ctk.CTkLabel(win, text="Selling is invite-only", font=self.f(20, "bold"), text_color=FG
+                     ).pack(anchor="w", padx=22, pady=(20, 2))
+        ctk.CTkLabel(win, text="Everyone can browse the market. To sell, you need a seller code from the "
+                     "app owner – ask them for one, then enter it here once.", font=self.f(12),
+                     text_color=MUTED, wraplength=390, justify="left").pack(anchor="w", padx=22)
+        e = ctk.CTkEntry(win, height=40, corner_radius=10, fg_color=CARD, border_color=BORDER, text_color=FG,
+                         font=self.f(15), placeholder_text="PAF-XXXX-XXXX-XXXX-XXXX")
+        e.pack(fill="x", padx=22, pady=(16, 6))
+        msg = ctk.CTkLabel(win, text="", font=self.f(12), text_color=BAD, anchor="w")
+        msg.pack(fill="x", padx=22)
+        btn = self._btn(win, "Use this code", lambda: check(), kind="accent", height=40)
+        btn.pack(fill="x", padx=22, pady=(8, 18))
+        e.focus_set()
+        e.bind("<Return>", lambda _e: check())
+
+        def check():
+            code = e.get().strip().upper()
+            if len(code.replace("-", "")) < 12:
+                msg.configure(text="That doesn’t look like a seller code.")
+                return
+            btn.configure(state="disabled", text="Checking…")
+
+            def job():
+                try:
+                    info = cloud.seller_check(code)
+                except cloud.CloudError as ex:
+                    info = {"error": str(ex)}
+                self.root.after(0, lambda: done(code, info))
+            threading.Thread(target=job, daemon=True).start()
+
+        def done(code, info):
+            if not win.winfo_exists():
+                return
+            btn.configure(state="normal", text="Use this code")
+            if not info or info.get("error"):
+                msg.configure(text=(info or {}).get("error") or "That code isn’t valid. Check it with the app owner.")
+                return
+            if not info.get("active"):
+                msg.configure(text="This seller account is disabled. Ask the app owner.")
+                return
+            self._store_seller_code(code)
+            self.seller_name = info.get("name", "")
+            self._set_status(f"Seller code saved – you sell as {self.seller_name}.", GOOD)
+            win.destroy()
+            self._render_seller_line()
+            if then:
+                then()
+
+    def _store_seller_code(self, code):
+        path = os.path.join(APP_DIR, "seller.key")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(code)
+        os.replace(tmp, path)
+        self.seller_code = code
+
+    def _forget_seller_code(self):
+        if not messagebox.askyesno("Seller code", "Remove the seller code from this PC? You can enter it "
+                                   "again later.", parent=self.root):
+            return
+        try:
+            os.remove(os.path.join(APP_DIR, "seller.key"))
+        except OSError:
+            pass
+        self.seller_code, self.seller_name = None, ""
+        self.market_mine = []
+        self._render_seller_line()
+        self._render_market()
+
+    def _render_seller_line(self):
+        """Market page: who you sell as (or how to start selling)."""
+        for w in self.seller_line.winfo_children():
+            w.destroy()
+        if self.seller_code:
+            name = self.seller_name or "…"
+            ctk.CTkLabel(self.seller_line, text=f"You sell as  {name}", font=self.f(12, "bold"),
+                         text_color=GOOD).pack(side="left")
+            self._btn(self.seller_line, "Remove code", self._forget_seller_code, kind="ghost", width=100,
+                      height=26).pack(side="left", padx=8)
+            if not self.seller_name and cloud.configured():
+                code = self.seller_code
+
+                def job():
+                    info = cloud.seller_check(code)
+                    self.net_q.put(("seller", info))
+                self._bg(job)
+        else:
+            ctk.CTkLabel(self.seller_line, text="Selling is invite-only.", font=self.f(12),
+                         text_color=MUTED).pack(side="left")
+            self._btn(self.seller_line, "Enter seller code", lambda: self._seller_code_dialog(), kind="ghost",
+                      width=130, height=26).pack(side="left", padx=8)
 
     @staticmethod
     def _age(ts):
@@ -1904,8 +2010,13 @@ class App:
             else:
                 self._btn(right, "Copy name", lambda n=r.get("seller", ""): self._copy(n), width=100,
                           height=28).pack(anchor="e", pady=(6, 0))
+                if self.admin_key:
+                    self._btn(right, "★ Remove", lambda i=r["id"], it=r.get("item", ""): self._admin_remove_listing(i, it),
+                              kind="danger", width=100, height=28).pack(anchor="e", pady=(4, 0))
         if not rows:
-            ctk.CTkLabel(self.market_list, text="Nothing here yet.", font=self.f(13), text_color=MUTED).pack(pady=30)
+            text = ("Enter your seller code to see and sell your own pet arts."
+                    if mine and not self.seller_code else "Nothing here yet.")
+            ctk.CTkLabel(self.market_list, text=text, font=self.f(13), text_color=MUTED).pack(pady=30)
 
     def _copy(self, text):
         self.root.clipboard_clear()
@@ -1913,7 +2024,9 @@ class App:
         self._set_status(f"Copied “{text}” – whisper them in game.", GOOD)
 
     def _market_action(self, what, listing_id):
-        key = self._owner()
+        key = self.seller_code
+        if not key:
+            return
         fn = cloud.mark_sold if what == "sold" else cloud.remove_listing
 
         def job():
@@ -1935,24 +2048,29 @@ class App:
         if not cloud.configured():
             self._set_status("The market isn’t online yet.", WARN)
             return
+        if not self.seller_code:
+            self._seller_code_dialog(then=self._sell_dialog)
+            return
         item = (self.slot_names.get(slot) or "Pet art")[:40]
         win = ctk.CTkToplevel(self.root)
         win.title("Sell on market")
         win.configure(fg_color=BG)
-        win.geometry("460x520")
+        win.geometry("460x500")
         win.transient(self.root)
         win.grab_set()
         ctk.CTkLabel(win, text="Sell on market", font=self.f(20, "bold"), text_color=FG).pack(anchor="w", padx=22,
                                                                                                pady=(18, 2))
         ctk.CTkLabel(win, text=item, font=self.f(15, "bold"), text_color=MUST_COL).pack(anchor="w", padx=22)
+        if self.seller_name:
+            ctk.CTkLabel(win, text=f"Selling as {self.seller_name}", font=self.f(12), text_color=MUTED
+                         ).pack(anchor="w", padx=22)
         box = ctk.CTkFrame(win, fg_color=CARD, corner_radius=12)
         box.pack(fill="x", padx=22, pady=10)
         for b, v in arts:
             ctk.CTkLabel(box, text=f"{b}   {v}", font=self.f(12), text_color=FG, anchor="w", height=20
                          ).pack(anchor="w", padx=14)
         entries = {}
-        for key, label, val in (("price", "Price in KK", ""), ("seller", "Your character name", self.seller),
-                                ("contact", "Note / contact (optional)", self.contact)):
+        for key, label, val in (("price", "Price in KK", ""), ("contact", "Note / contact (optional)", self.contact)):
             ctk.CTkLabel(win, text=label, font=self.f(12), text_color=MUTED).pack(anchor="w", padx=22)
             e = ctk.CTkEntry(win, height=34, corner_radius=10, fg_color=CARD, border_color=BORDER, text_color=FG)
             e.insert(0, val)
@@ -1971,17 +2089,12 @@ class App:
             if not ok:
                 messagebox.showwarning("Price", "Enter the price in KK as a number, e.g. 150 or 2.5", parent=win)
                 return
-            seller = entries["seller"].get().strip()
-            if not 2 <= len(seller) <= 24:
-                messagebox.showwarning("Name", "Enter your character name (2-24 letters) so buyers can whisper "
-                                               "you.", parent=win)
-                return
-            self.seller, self.contact = seller, entries["contact"].get().strip()[:80]
+            self.contact = entries["contact"].get().strip()[:80]
             self._save()
-            key, contact = self._owner(), self.contact
+            key, contact = self.seller_code, self.contact
 
             def job():
-                cloud.add_listing(key, seller, contact, item, arts, price, updater.APP_VERSION)
+                cloud.add_listing(key, contact, item, arts, price, updater.APP_VERSION)
                 self.net_q.put(("msg", (f"Listed {item} for {price:g} KK on the market.", GOOD)))
                 self.market_at = 0.0
             self._bg(job)
@@ -2161,6 +2274,19 @@ class App:
             elif kind == "restart":
                 self._close()
                 return
+            elif kind == "seller":
+                self.seller_name = (data or {}).get("name", "") if data and data.get("active") else ""
+                if not data:
+                    self._set_status("Your seller code isn’t valid any more – ask the app owner.", WARN)
+                elif not data.get("active"):
+                    self._set_status("Your seller account is disabled.", WARN)
+                self._render_seller_line()
+            elif kind == "sellers":
+                self.sellers = data or []
+                self._render_sellers()
+            elif kind == "seller_code":
+                self._show_seller_code(*data)
+                self._admin_load_sellers()
             elif kind in ("market", "mine"):
                 if kind == "market":
                     self.market_rows = data or []
@@ -2302,7 +2428,132 @@ class App:
                             "★ preset in everyone’s app within a few minutes. Keep admin.key private.")
             ad.pack(fill="x", padx=28, pady=(0, 16))
 
+            sc = self._card(pg, "★ Sellers", "Only people you add here can sell on the market. Add a player, "
+                            "then send them their seller code (e.g. on Discord) – they enter it once in the "
+                            "app. Disable someone to hide all their listings at once.")
+            sc.pack(fill="x", padx=28, pady=(0, 16))
+            row = ctk.CTkFrame(sc, fg_color="transparent")
+            row.pack(fill="x", padx=18, pady=(4, 8))
+            self.new_seller = ctk.CTkEntry(row, height=34, width=260, corner_radius=10, fg_color=CARD2,
+                                           border_color=BORDER, text_color=FG, font=self.f(13),
+                                           placeholder_text="Character name")
+            self.new_seller.pack(side="left")
+            self.new_seller.bind("<Return>", lambda _e: self._admin_create_seller())
+            self._btn(row, "+ Add seller", self._admin_create_seller, kind="accent", width=120).pack(side="left", padx=8)
+            self._btn(row, "↻", self._admin_load_sellers, width=34).pack(side="left")
+            self.sellers_box = ctk.CTkFrame(sc, fg_color="transparent")
+            self.sellers_box.pack(fill="x", padx=18, pady=(0, 16))
+            self._render_sellers()
+            if cloud.configured():
+                self.root.after(1500, self._admin_load_sellers)
+
         return pg
+
+    # ------------------------------------------------------------ admin: sellers
+    def _admin_load_sellers(self):
+        if self.admin_key and cloud.configured():
+            key = self.admin_key
+            self._bg(lambda: self.net_q.put(("sellers", cloud.admin_sellers(key))))
+
+    def _admin_create_seller(self):
+        name = self.new_seller.get().strip()
+        if not 2 <= len(name) <= 24:
+            self._set_status("Enter the player’s character name (2-24 characters).", WARN)
+            return
+        key = self.admin_key
+
+        def job():
+            code = cloud.admin_create_seller(key, name)
+            self.net_q.put(("seller_code", (name, code, True)))
+        self.new_seller.delete(0, "end")
+        self._bg(job)
+
+    def _admin_seller_action(self, what, seller):
+        key, sid, name = self.admin_key, seller["id"], seller["name"]
+        if what == "delete" and not messagebox.askyesno(
+                "Delete seller", f"Delete {name}? Their code stops working and all their listings are removed.",
+                parent=self.root):
+            return
+        if what == "code" and not messagebox.askyesno(
+                "New code", f"Make a new code for {name}? The old one stops working right away "
+                            "(their listings stay).", parent=self.root):
+            return
+
+        def job():
+            if what == "toggle":
+                cloud.admin_set_seller_active(key, sid, not seller["active"])
+            elif what == "delete":
+                cloud.admin_delete_seller(key, sid)
+            elif what == "code":
+                self.net_q.put(("seller_code", (name, cloud.admin_new_seller_code(key, sid), False)))
+                return
+            self.net_q.put(("sellers", cloud.admin_sellers(key)))
+            self.market_at = 0.0
+        self._bg(job)
+
+    def _admin_remove_listing(self, listing_id, item):
+        if not messagebox.askyesno("Remove listing", f"Remove “{item}” from the market?", parent=self.root):
+            return
+        key = self.admin_key
+
+        def job():
+            cloud.admin_remove_listing(key, listing_id)
+            self.net_q.put(("market", cloud.market()))
+            self.net_q.put(("msg", ("Listing removed.", GOOD)))
+        self._bg(job)
+
+    def _render_sellers(self):
+        box = getattr(self, "sellers_box", None)
+        if box is None:
+            return
+        for w in box.winfo_children():
+            w.destroy()
+        if not self.sellers:
+            ctk.CTkLabel(box, text="No sellers yet – nobody can sell until you add someone.", font=self.f(12),
+                         text_color=MUTED, anchor="w").pack(fill="x")
+            return
+        for sl in self.sellers:
+            r = ctk.CTkFrame(box, fg_color=CARD2, corner_radius=10)
+            r.pack(fill="x", pady=3)
+            on = sl.get("active")
+            ctk.CTkLabel(r, text=sl.get("name", "?"), font=self.f(13, "bold"), text_color=FG if on else MUTED,
+                         anchor="w", width=170).pack(side="left", padx=(12, 4), pady=6)
+            n = int(sl.get("listings") or 0)
+            ctk.CTkLabel(r, text=(f"{n} listing{'s' if n != 1 else ''}" if on else "disabled"), font=self.f(12),
+                         text_color=MUTED if on else WARN, anchor="w", width=90).pack(side="left")
+            self._btn(r, "Delete", lambda x=sl: self._admin_seller_action("delete", x), kind="danger", width=70,
+                      height=28).pack(side="right", padx=(4, 8))
+            self._btn(r, "New code", lambda x=sl: self._admin_seller_action("code", x), width=86,
+                      height=28).pack(side="right", padx=4)
+            self._btn(r, "Disable" if on else "Enable", lambda x=sl: self._admin_seller_action("toggle", x),
+                      width=76, height=28).pack(side="right", padx=4)
+
+    def _show_seller_code(self, name, code, new):
+        """The code is only shown here, once (only its hash is stored online)."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("Seller code")
+        win.configure(fg_color=BG)
+        win.geometry("460x300")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        ctk.CTkLabel(win, text=f"{'Seller added' if new else 'New code'}: {name}", font=self.f(19, "bold"),
+                     text_color=FG).pack(anchor="w", padx=22, pady=(20, 4))
+        ctk.CTkLabel(win, text="Send this code to the player. They enter it once in the app (Market → Enter "
+                     "seller code). It’s shown only now – if it gets lost, make a new one.", font=self.f(12),
+                     text_color=MUTED, wraplength=410, justify="left").pack(anchor="w", padx=22)
+        ctk.CTkLabel(win, text=code, font=("Consolas", 22, "bold"), text_color=ACCENT, fg_color=CARD,
+                     corner_radius=12, height=58).pack(fill="x", padx=22, pady=16)
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=22)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(code)
+            cb.configure(text="✓ Copied")
+        cb = self._btn(row, "Copy code", copy, kind="accent", width=150)
+        cb.pack(side="left")
+        self._btn(row, "Done", win.destroy, width=100).pack(side="right")
 
     def _strip_drag(self, e, final=False):
         x = min(max(e.x - self._strip_pad, 0), self._strip_w - 1)
