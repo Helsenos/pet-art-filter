@@ -756,6 +756,122 @@ def save_dataset(img, cx, box, name, arts):
 
 
 # ================================================================ overlay
+class GameLayer:
+    """Keeps the glow layer and the mini bar directly above the game window in the
+    window stack (instead of always-on-top): programs you put over the game also
+    cover the glows, and a minimized game takes them along.
+    The game is recognised by its program (.exe): learned from the window under the
+    mouse whenever a pet art was read successfully - that window can only be the game."""
+    GW_HWNDNEXT, GW_HWNDPREV = 2, 3
+    HWND_TOP, HWND_BOTTOM = 0, 1
+    SWP_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200 | 0x0400   # no size/move/activate/owner/changing
+
+    def __init__(self, exe=None):
+        self.exe = exe          # e.g. "metin2client.exe" (saved in the config)
+        self.game = None
+        self._names = {}
+        user32.GetWindow.restype = wt.HWND
+        user32.GetTopWindow.restype = wt.HWND
+
+    def _exe_of(self, h):
+        if h in self._names:
+            return self._names[h]
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        name = None
+        if pid.value and pid.value != os.getpid():
+            k32 = ctypes.windll.kernel32
+            hp = k32.OpenProcess(0x1000, False, pid.value)          # query limited information
+            if hp:
+                buf, n = ctypes.create_unicode_buffer(520), wt.DWORD(520)
+                if k32.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(n)):
+                    name = os.path.basename(buf.value).lower()
+                k32.CloseHandle(hp)
+        if len(self._names) > 500:
+            self._names.clear()
+        self._names[h] = name
+        return name
+
+    @staticmethod
+    def _rect_has(h, x, y):
+        r = wt.RECT()
+        return bool(user32.GetWindowRect(h, ctypes.byref(r))) and r.left <= x < r.right and r.top <= y < r.bottom
+
+    @staticmethod
+    def _cloaked(h):
+        v = ctypes.c_int(0)
+        try:
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(h, 14, ctypes.byref(v), ctypes.sizeof(v))
+        except OSError:
+            return False
+        return bool(v.value)
+
+    def _usable(self, h):
+        if not user32.IsWindowVisible(h) or self._cloaked(h):
+            return False
+        return not (user32.GetWindowLongW(h, -20) & 0x20)      # click-through layers aren't windows you see
+
+    def _top_window_at(self, x, y):
+        h = user32.GetTopWindow(None)
+        while h:
+            if not user32.IsIconic(h) and self._usable(h) and self._rect_has(h, x, y):
+                return h
+            h = user32.GetWindow(h, self.GW_HWNDNEXT)
+        return None
+
+    def learn(self, x, y):
+        """A pet art was just read at (x, y): the window there is the game. -> True if new."""
+        h = self._top_window_at(x, y)
+        exe = self._exe_of(h) if h else None
+        if not exe:                      # our own window or unknown: learn nothing
+            return False
+        self.game = h
+        if exe != self.exe:
+            self.exe = exe
+            return True
+        return False
+
+    def track(self, point):
+        """Find the game's window again (game restarted, new window...)."""
+        if not self.exe:
+            return
+        if self.game and user32.IsWindow(self.game) and self._exe_of(self.game) == self.exe:
+            return
+        self.game, fallback = None, None
+        h = user32.GetTopWindow(None)
+        while h:
+            if user32.IsWindowVisible(h) and self._exe_of(h) == self.exe:
+                if point is None or self._rect_has(h, *point):
+                    self.game = h
+                    return
+                fallback = fallback or h
+            h = user32.GetWindow(h, self.GW_HWNDNEXT)
+        self.game = fallback
+
+    def place(self, layers, ours):
+        """layers: our windows, bottom first. Returns False when the game isn't known."""
+        g = self.game
+        if not g or not user32.IsWindow(g):
+            return False
+        if user32.IsIconic(g):          # minimized game: glows go to the very back
+            for h in layers:
+                user32.SetWindowPos(h, self.HWND_BOTTOM, 0, 0, 0, 0, self.SWP_FLAGS)
+            return True
+        below = user32.GetWindow(layers[0], self.GW_HWNDNEXT)
+        while below and below in ours:
+            below = user32.GetWindow(below, self.GW_HWNDNEXT)
+        if below == g:                   # already right above the game: nothing to do
+            return True
+        above = user32.GetWindow(g, self.GW_HWNDPREV)
+        while above and above in ours:
+            above = user32.GetWindow(above, self.GW_HWNDPREV)
+        topmost = above and user32.GetWindowLongW(above, -20) & 0x8
+        after = self.HWND_TOP if not above or topmost else above
+        for h in layers:                 # each goes right below `after`: the last one ends up on top
+            user32.SetWindowPos(h, after, 0, 0, 0, 0, self.SWP_FLAGS)
+        return True
+
+
 class Overlay:
     """Click-through, always-on-top transparent window that draws slot marks."""
 
@@ -801,8 +917,6 @@ class Overlay:
             self.pulse = not self.pulse
         try:
             self.redraw()
-            if self.ticks % 15 == 0:
-                self.win.attributes("-topmost", True)
         except tk.TclError:
             return
         self.win.after(60, self._tick)
@@ -945,7 +1059,6 @@ class MiniBar:
     def show(self, on):
         if on:
             self.win.deiconify()
-            self.win.attributes("-topmost", True)
         else:
             self.win.withdraw()
 
@@ -1111,6 +1224,8 @@ class App:
         self._load()
         self.overlay = Overlay(root)
         self.minibar = MiniBar(self)
+        self.game_layer = GameLayer(self._game_exe)
+        self._layers_topmost = True
         self._rec_on = self.rec_mode.get()
         self.overlay.set_capture_mode(not self._rec_on)
         self.minibar.set_capture_mode(not self._rec_on)
@@ -1341,6 +1456,28 @@ class App:
         def step(t):
             f.attributes("-alpha", 0.92 * (1 - t))
         self._animate("fade", 170, step, done=f.withdraw)
+
+    def _keep_layers_above_game(self):
+        """Glows + mini bar sit right above the game window. Until the game is known they
+        stay always-on-top (the old behaviour) so they're never hidden by mistake."""
+        try:
+            ours = {self.overlay.hwnd, self.minibar.hwnd, user32.GetParent(self.root.winfo_id())}
+            fade = getattr(self, "_fade", None)
+            if fade is not None:
+                ours.add(user32.GetParent(fade.winfo_id()))
+            g = self.grids[0] if self.grids else None
+            point = (g["x"] + g["w"] / 2, g["y"] + g["h"] / 2) if g else None
+            if self._tick % 30 == 0:           # ~once a second: find the game window again if needed
+                self.game_layer.track(point)
+            known = self.game_layer.game is not None
+            if known == self._layers_topmost:      # switch between the two modes
+                self._layers_topmost = not known
+                self.overlay.win.attributes("-topmost", not known)
+                self.minibar.win.attributes("-topmost", not known)
+            if known:
+                self.game_layer.place([self.overlay.hwnd, self.minibar.hwnd], ours)
+        except Exception:
+            pass
 
     def _page_title(self, parent, title, subtitle):
         h = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2945,6 +3082,7 @@ class App:
         self.official = cfg.get("official_cache", [])
         self.official_on = cfg.get("official_on", {})
         self.seller, self.contact = cfg.get("seller", ""), cfg.get("contact", "")
+        self._game_exe = cfg.get("game_exe") if isinstance(cfg.get("game_exe"), str) else None
         self.profiles = cfg.get("profiles") or []
         if not self.profiles:   # first start with presets: turn the old single filter into one
             old = {}
@@ -2989,6 +3127,8 @@ class App:
         cfg["official_on"] = self.official_on
         cfg["official_cache"] = self.official
         cfg["seller"], cfg["contact"] = self.seller, self.contact
+        gl = getattr(self, "game_layer", None)
+        cfg["game_exe"] = gl.exe if gl else getattr(self, "_game_exe", None)
         cfg["theme"], cfg["accent"] = self.theme, self.accent
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
@@ -3313,6 +3453,7 @@ class App:
             self._last_official = time.time()
             self._bg(self._fetch_official)
         self._tick = getattr(self, "_tick", 0) + 1
+        self._keep_layers_above_game()
         if self._tick % 10 == 0:   # ~3x a second is plenty for the status texts
             pending = self.ocr_q.qsize()
             if self.scanner or pending:
@@ -3368,6 +3509,10 @@ class App:
         matched = self._match_all(found)
         good = bool(matched)
         complete = len(found) >= ARTS_PER_PET
+        if complete and slot[0] < len(self.grids):
+            x0, y0, x1, y1 = slot_rect(self.grids[slot[0]], slot[1], slot[2])
+            if self.game_layer.learn((x0 + x1) / 2, (y0 + y1) / 2):
+                self._save()
         if complete:
             self.marks[slot] = "good" if good else "bad"
             if good:
