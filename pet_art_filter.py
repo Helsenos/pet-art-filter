@@ -949,6 +949,7 @@ class Overlay:
         self.shade, self.scv, self.shade_hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
         self.shade.attributes("-alpha", 0.7)
         self._shade_sig = None
+        self._hover, self._hover_t = None, 0.0
         self.tips = {}           # (grid, row, col) -> screen box of that slot's tooltip
         self.tip_rel = None      # where tooltips open, relative to the slot (from the last read)
         self.win, self.cv, self.hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
@@ -999,11 +1000,15 @@ class Overlay:
         self.tip_rel = (t[0] - cx, t[1] - base, t[2] - cx, t[3] - base, below)
 
     def _tip_holes(self, grids):
-        """Screen boxes the shade must leave clear right now: the hovered slot and its tooltip
-        (the game draws tooltips below this layer)."""
+        """-> (hovered slot, [screen boxes the shade leaves clear]). The game draws tooltips below
+        this layer, so the tooltip's area is cleared - but only once the mouse rests on a slot:
+        sweeping over the grid while scanning changes nothing (no flashing)."""
         s = slot_at(grids, *cursor_pos())
-        if s is None:
-            return []
+        now = time.perf_counter()
+        if s != self._hover:
+            self._hover, self._hover_t = s, now
+        if s is None or now - self._hover_t < 0.35:
+            return s, []
         gi, r, c = s
         sx0, sy0, sx1, sy1 = slot_rect(grids[gi], r, c)
         cx = (sx0 + sx1) / 2
@@ -1017,18 +1022,19 @@ class Overlay:
         if tip is None:                # not known yet: clear the whole area a tooltip can use
             tip = (cx - CAPTURE["width"] / 2, sy0 - CAPTURE["above"], cx + CAPTURE["width"] / 2,
                    sy1 + CAPTURE["below"])
-        return [(sx0, sy0, sx1, sy1), tip]
+        return s, [tip]
 
     def _redraw_shade(self, grids, marks, style):
         ox, oy = self.vx, self.vy
         rects = []
         if self.cover != "all" and style.get("bad") == "Shade":
-            holes = self._tip_holes(grids)
+            hover, holes = self._tip_holes(grids)
             for (gi, pg, r, c), status in marks.items():
                 if status != "bad" or gi >= len(grids) or pg != self.pages.get(gi, 0):
                     continue
                 x0, y0, x1, y1 = slot_rect(grids[gi], r, c)
-                if any(x0 < h[2] and h[0] < x1 and y0 < h[3] and h[1] < y1 for h in holes):
+                if (gi, r, c) != hover and any(x0 < h[2] and h[0] < x1 and y0 < h[3] and h[1] < y1
+                                               for h in holes):      # the hovered slot itself stays dark
                     continue
                 rects.append((int(x0 - ox) + 1, int(y0 - oy) + 1, int(x1 - ox) - 1, int(y1 - oy) - 1))
         sig = (tuple(rects), self.cover)
