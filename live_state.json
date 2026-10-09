@@ -1,6 +1,6 @@
 {
- "time": "23:21:00",
- "version": "1.1.8",
+ "time": "23:37:32",
+ "version": "1.1.9",
  "scanning": false,
  "page_shown": "scan",
  "marks": {},
@@ -20,6 +20,6 @@
    0
   ]
  ],
- "loop_ms_max": 0.2,
+ "loop_ms_max": 0.5,
  "ocr_queue": 0
 }

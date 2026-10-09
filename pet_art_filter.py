@@ -3656,6 +3656,10 @@ class App:
             pending = self.ocr_q.qsize()
             if self.scanner or pending:
                 self._set_status(f"{pending} waiting to be read" if pending else "Scanning…")
+                self._status_busy = True
+            elif getattr(self, "_status_busy", False):     # scan stopped and everything read
+                self._status_busy = False
+                self._set_status("Ready")
             if self._page == "settings":        # only while you can see it
                 names, values = self.reader.known()
                 self.learn_lbl.configure(
