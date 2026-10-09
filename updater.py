@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -45,9 +46,23 @@ def can_self_update():
 
 
 def check_latest(timeout=6):
-    """-> dict(version, notes, url, size) for the latest release, or None."""
+    """-> dict(version, notes, url, size, sig_url) for the latest release, or None.
+    Asks GitHub's API first (it has the release notes). The API allows only 60 requests
+    an hour per internet connection - shared by everyone behind the same address - so
+    when it fails, the plain release page is used instead (no limit, no notes).
+    Either way the download is checked against the signature before installing."""
     if not UPDATE_REPO:
         return None
+    try:
+        return _latest_from_api(timeout)
+    except Exception as api_error:
+        try:
+            return _latest_from_page(timeout)
+        except Exception:
+            raise api_error
+
+
+def _latest_from_api(timeout):
     req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
                                  headers={"User-Agent": USER_AGENT,
                                           "Accept": "application/vnd.github+json"})
@@ -61,6 +76,46 @@ def check_latest(timeout=6):
     return {"version": rel.get("tag_name", "").lstrip("vV"), "notes": rel.get("body") or "",
             "url": asset["browser_download_url"], "size": asset.get("size", 0),
             "sig_url": sig["browser_download_url"] if sig else None}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _latest_from_page(timeout):
+    """github.com/<repo>/releases/latest redirects to .../releases/tag/v1.2.3"""
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(f"https://github.com/{UPDATE_REPO}/releases/latest",
+                                 headers={"User-Agent": USER_AGENT})
+    try:
+        opener.open(req, timeout=timeout)
+        return None
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location", "") if e.code in (301, 302, 303, 307, 308) else ""
+    m = re.search(r"/releases/tag/v?(\d+(?:\.\d+){1,3})$", loc)
+    if not m:
+        return None
+    ver = m.group(1)
+    base = f"https://github.com/{UPDATE_REPO}/releases/download/v{ver}/"
+    return {"version": ver, "notes": "", "url": base + f"Pet.Art.Filter.v{ver}.zip", "size": 0,
+            "sig_url": base + SIG_NAME}
+
+
+def describe_error(e):
+    """Short, human reason why the update check failed."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (403, 429):
+            return "GitHub is limiting update checks from your connection right now – try again later."
+        return f"The update server answered with an error ({e.code})."
+    reason = str(getattr(e, "reason", e)).lower()
+    if "certificate" in reason or "ssl" in reason:
+        return "Secure connection failed – check that your PC's date and time are right."
+    if "timed out" in reason or "timeout" in reason:
+        return "The update server didn't answer in time – check your internet or firewall."
+    if "getaddrinfo" in reason or "name" in reason and "resolv" in reason:
+        return "No internet connection (or GitHub is blocked)."
+    return "Couldn’t reach the update server – check your internet or firewall."
 
 
 def _official(url):

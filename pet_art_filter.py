@@ -2581,9 +2581,9 @@ class App:
             return
         try:
             info = updater.check_latest()
-        except Exception:
+        except Exception as e:
             if manual:
-                self.net_q.put(("update_none", "Couldn’t reach the update server – check your internet."))
+                self.net_q.put(("update_none", updater.describe_error(e)))
             return          # automatic check: just try again later
         if info and updater.is_newer(info["version"]):
             self.net_q.put(("update", info))
