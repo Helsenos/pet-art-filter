@@ -22,7 +22,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-APP_VERSION = "1.1.10"
+APP_VERSION = "1.1.11"
 UPDATE_REPO = "Helsenos/pet-art-filter"
 # Every release is signed with the owner's private key (kept only on the owner's PC);
 # an update is installed only if its signature matches this public key.

@@ -25,7 +25,14 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Fixed: the status line stayed on "Scanning..." after scanning stopped
+NOTES = """- New gem icon (window, taskbar, shortcut) and a loading picture while the app starts
+- Reads more pet arts: ones with an unclear "From PLvl" line were skipped until F7
+- Fast mouse moves can no longer give a slot the previous item's values (also for selling)
+- Scanning recovers by itself after the lock screen or an admin prompt
+- Updates: if something goes wrong the old version is restored; a failed update is reported;
+  works when GitHub is only reachable through Windows; "Open download page" button
+- Market shows when it can't load; seller check, pictures and price fixes
+- Many smaller fixes (themes, glow animation, grid finder, presets from the server)
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
