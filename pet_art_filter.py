@@ -825,22 +825,22 @@ class MiniBar:
         bar = ctk.CTkFrame(self.win, corner_radius=0, fg_color=self.KEY, bg_color=self.KEY, border_width=0)
         bar.pack()
         f = lambda size, w="bold": ctk.CTkFont(family="Segoe UI", size=size, weight=w)  # noqa: E731
-        rb = dict(width=24, height=24, corner_radius=2, border_width=1, border_color=self.BRONZE_DIM,
-                  fg_color=self.BTN, hover_color=self.BTN_HOVER, bg_color=self.KEY, font=f(12))
+        rb = dict(width=28, height=28, corner_radius=2, border_width=1, border_color=self.BRONZE_DIM,
+                  fg_color=self.BTN, hover_color=self.BTN_HOVER, bg_color=self.KEY, font=f(14))
         self.go = ctk.CTkButton(bar, text="▶", text_color=self.GREEN, command=app._toggle, **rb)
         self.go.pack(side="left", padx=(0, 2))
         ctk.CTkButton(bar, text="✕", text_color=self.PARCHMENT, command=app._clear_marks,
                       **rb).pack(side="left", padx=2)
         well = ctk.CTkFrame(bar, corner_radius=2, fg_color=self.WELL, bg_color=self.KEY, border_width=1,
-                            border_color=self.BRONZE_DIM, height=24)
+                            border_color=self.BRONZE_DIM, height=28)
         well.pack(side="left", padx=2)
-        self.count = ctk.CTkLabel(well, text="✦ 0", font=f(12), text_color=self.GOLD, width=40, height=20)
+        self.count = ctk.CTkLabel(well, text="✦ 0", font=f(14), text_color=self.GOLD, width=46, height=24)
         self.count.pack(padx=2, pady=1)
         ctk.CTkButton(bar, text="◆", text_color=self.VIOLET, command=self._open_app,
                       **rb).pack(side="left", padx=2)
         # drag handle: a solid little square (clicks on see-through pixels would go to the game)
         grip = ctk.CTkLabel(bar, text="⋮", font=f(13), text_color=self.BRONZE, fg_color=self.BTN,
-                            bg_color=self.KEY, corner_radius=2, width=12, height=24, cursor="fleur")
+                            bg_color=self.KEY, corner_radius=2, width=13, height=28, cursor="fleur")
         grip.pack(side="left", padx=(2, 0))
         grip.bind("<ButtonPress-1>", self._drag_start)
         grip.bind("<B1-Motion>", self._drag_move)
