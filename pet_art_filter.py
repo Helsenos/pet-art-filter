@@ -1320,6 +1320,11 @@ class App:
         root.after(UPDATE_EVERY_MS, self._periodic_update_check)
         root.after(3000, self._prebuild_cards)
         root.protocol("WM_DELETE_WINDOW", self._close)
+        # a close request to any of our windows (Windows shutdown, taskkill...) closes the app
+        # cleanly - not just that one window
+        for w in (self.overlay.win, self.minibar.win):
+            w.protocol("WM_DELETE_WINDOW", self._close)
+        root.protocol("WM_SAVE_YOURSELF", self._save)       # logoff / shutdown: save first
         root.after(30, self._poll)
 
     # ------------------------------------------------------------ style / layout
@@ -1511,6 +1516,7 @@ class App:
         f = getattr(self, "_fade", None)
         if f is None:
             f = self._fade = tk.Toplevel(self.root)
+            f.protocol("WM_DELETE_WINDOW", self._close)
             f.overrideredirect(True)
             f.withdraw()
             f.update_idletasks()
