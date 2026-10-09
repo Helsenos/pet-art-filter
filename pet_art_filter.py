@@ -662,6 +662,13 @@ class OcrWorker(threading.Thread):
                 name, arts, debug, box = self.reader.read(np.asarray(img), cx, want_box=True)
                 ms = (time.perf_counter() - t) * 1000
                 self.result_q.put(("result", (seq, slot, name, arts, debug, same_item, ms)))
+                if len(arts) >= ARTS_PER_PET and box:      # after the result: the glow never waits for this
+                    try:
+                        pic = tooltip_picture(img, box)
+                        if pic:
+                            self.result_q.put(("pic", (seq, slot, pic)))
+                    except Exception:
+                        pass
                 if arts and box:
                     save_dataset(img, cx, box, name, arts)
                 if 0 < len(arts) < ARTS_PER_PET:
@@ -677,6 +684,38 @@ class OcrWorker(threading.Thread):
                     pass
             except Exception as e:
                 self.result_q.put(("error", f"{type(e).__name__}: {e}"))
+
+
+PIC_DIR = os.path.join(APP_DIR, "pictures")      # cache of market tooltip pictures
+
+
+def tooltip_picture(img, box):
+    """Small WebP of the tooltip (item name ... [Pet Artifact]) for a market listing."""
+    import io
+    x0, y0, x1, y1 = box
+    crop = img.crop((max(0, int(x0) - 14), max(0, int(y0) - 8),
+                     min(img.width, int(x1) + 14), min(img.height, int(y1) + 6)))
+    for q in (85, 70, 55):
+        buf = io.BytesIO()
+        crop.save(buf, "WEBP", quality=q, method=4)
+        if len(buf.getvalue()) <= cloud.MAX_PICTURE:
+            return buf.getvalue()
+    return None
+
+
+def open_picture(data):
+    """Picture from another player -> PIL image, or None. Only small WebP images are opened."""
+    import io
+    try:
+        if not data or len(data) > cloud.MAX_PICTURE or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            return None
+        im = Image.open(io.BytesIO(data))
+        if im.format != "WEBP" or not (20 <= im.width <= 600 and 20 <= im.height <= 600):
+            return None
+        im.load()
+        return im.convert("RGB")
+    except Exception:
+        return None
 
 
 def save_training(img, cx, debug):
@@ -1088,6 +1127,12 @@ class App:
         self.icons = {}        # slot -> item icon when it was read (skip re-reading the same item)
         self.slot_arts = {}    # slot -> {bonus: value} gathered over hovers of the same item
         self.slot_names = {}   # slot -> item name ("Brown Collar +0")
+        self.slot_pics = {}    # slot -> WebP picture of its tooltip (for the market)
+        self.pic_cache = {}    # listing id -> CTkImage (None = no picture)
+        self.pic_labels = {}   # listing id -> label waiting for its picture
+        self.pic_q = queue.Queue()
+        self.pic_wanted = set()
+        threading.Thread(target=self._pic_loader, daemon=True).start()
         self.mark_colors = {}  # slot -> colours of the presets it matched
         self.profiles = []     # my filter presets
         self.official = []     # presets published by the app owner (downloaded)
@@ -1998,7 +2043,14 @@ class App:
                              wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
             mid = ctk.CTkFrame(card, fg_color="transparent")
             mid.grid(row=0, column=1, sticky="nw", pady=12)
-            for i, b in enumerate(r.get("bonuses") or []):
+            if r.get("has_picture") is True and self._listing_picture(mid, r["id"]):
+                if self._match_all([(b[0], b[1]) for b in r.get("bonuses") or []]):
+                    ctk.CTkLabel(left, text="★ matches your presets", font=self.f(12, "bold"),
+                                 text_color=ACCENT, anchor="w").pack(anchor="w", pady=(4, 0))
+                bonus_rows = []
+            else:
+                bonus_rows = r.get("bonuses") or []
+            for i, b in enumerate(bonus_rows):
                 hit = b[0] in wanted
                 ctk.CTkLabel(mid, text=f"{b[0]}  {b[1]}", font=self.f(12, "bold" if hit else "normal"),
                              text_color=ACCENT if hit else FG, anchor="w", height=18
@@ -2026,6 +2078,66 @@ class App:
                     if mine and not self.seller_code else "Nothing here yet.")
             ctk.CTkLabel(self.market_list, text=text, font=self.f(13), text_color=MUTED).pack(pady=30)
 
+    # ------------------------------------------------------------ market pictures
+    def _listing_picture(self, parent, lid):
+        """Put the listing's tooltip picture into parent (loads it in the background).
+        Returns False if the listing has no usable picture (then the bonuses are shown as text)."""
+        if not re.fullmatch(r"[0-9a-f-]{36}", lid):
+            return False
+        if lid in self.pic_cache:
+            img = self.pic_cache[lid]
+            if img is None:
+                return False
+            ctk.CTkLabel(parent, text="", image=img).pack(anchor="w")
+            return True
+        lbl = ctk.CTkLabel(parent, text="Loading tooltip…", font=self.f(12), text_color=MUTED, width=220,
+                           height=60, anchor="w")
+        lbl.pack(anchor="w")
+        self.pic_labels[lid] = lbl
+        if lid not in self.pic_wanted:
+            self.pic_wanted.add(lid)
+            self.pic_q.put(lid)
+        return True
+
+    def _pic_loader(self):
+        """One picture at a time; each is downloaded once and then kept on disk for 35 days."""
+        try:
+            os.makedirs(PIC_DIR, exist_ok=True)
+            old = time.time() - 35 * 86400
+            for f in os.listdir(PIC_DIR):
+                fp = os.path.join(PIC_DIR, f)
+                if os.path.getmtime(fp) < old:
+                    os.remove(fp)
+        except OSError:
+            pass
+        while True:
+            lid = self.pic_q.get()
+            path = os.path.join(PIC_DIR, lid + ".webp")
+            data = None
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read(cloud.MAX_PICTURE + 1)
+            except OSError:
+                try:
+                    data = cloud.listing_picture(lid)
+                    if data and open_picture(data) is not None:
+                        with open(path, "wb") as fh:
+                            fh.write(data)
+                except Exception:
+                    data = None
+            self.net_q.put(("picture", (lid, open_picture(data) if data else None)))
+
+    def _picture_loaded(self, lid, im):
+        self.pic_wanted.discard(lid)
+        img = ctk.CTkImage(im, size=im.size) if im is not None else None
+        self.pic_cache[lid] = img
+        lbl = self.pic_labels.pop(lid, None)
+        if lbl is not None and lbl.winfo_exists():
+            if img is not None:
+                lbl.configure(text="", image=img, width=im.width, height=im.height)
+            else:
+                lbl.configure(text="(picture not available)")
+
     @staticmethod
     def _valid_listing(r):
         """Listings are other players' data: show only well-formed ones."""
@@ -2041,6 +2153,8 @@ class App:
                 if not (isinstance(b, list) and len(b) == 2 and isinstance(b[0], str)
                         and isinstance(b[1], (int, float)) and not isinstance(b[1], bool)):
                     return False
+            if not isinstance(r.get("has_picture", False), bool):
+                return False
             return all(isinstance(r.get(k, ""), str) for k in ("item", "seller", "contact"))
         except (TypeError, ValueError):
             return False
@@ -2079,10 +2193,12 @@ class App:
             self._seller_code_dialog(then=self._sell_dialog)
             return
         item = (self.slot_names.get(slot) or "Pet art")[:40]
+        pic = self.slot_pics.get(slot)
+        pim = open_picture(pic) if pic else None
         win = ctk.CTkToplevel(self.root)
         win.title("Sell on market")
         win.configure(fg_color=BG)
-        win.geometry("460x500")
+        win.geometry(f"460x{560 + (pim.height - 120 if pim else 0)}")
         win.transient(self.root)
         win.grab_set()
         ctk.CTkLabel(win, text="Sell on market", font=self.f(20, "bold"), text_color=FG).pack(anchor="w", padx=22,
@@ -2093,9 +2209,14 @@ class App:
                          ).pack(anchor="w", padx=22)
         box = ctk.CTkFrame(win, fg_color=CARD, corner_radius=12)
         box.pack(fill="x", padx=22, pady=10)
-        for b, v in arts:
-            ctk.CTkLabel(box, text=f"{b}   {v}", font=self.f(12), text_color=FG, anchor="w", height=20
-                         ).pack(anchor="w", padx=14)
+        if pim:      # buyers see the real tooltip
+            ctk.CTkLabel(box, text="", image=ctk.CTkImage(pim, size=pim.size)).pack(padx=10, pady=10)
+        else:
+            for b, v in arts:
+                ctk.CTkLabel(box, text=f"{b}   {v}", font=self.f(12), text_color=FG, anchor="w", height=20
+                             ).pack(anchor="w", padx=14)
+            ctk.CTkLabel(box, text="(no picture – hover the pet art once more to add one)", font=self.f(11),
+                         text_color=MUTED, anchor="w").pack(anchor="w", padx=14, pady=(2, 8))
         entries = {}
         for key, label, val in (("price", "Price in KK", ""), ("contact", "Note / contact (optional)", self.contact)):
             ctk.CTkLabel(win, text=label, font=self.f(12), text_color=MUTED).pack(anchor="w", padx=22)
@@ -2121,7 +2242,7 @@ class App:
             key, contact = self.seller_code, self.contact
 
             def job():
-                cloud.add_listing(key, contact, item, arts, price, updater.APP_VERSION)
+                cloud.add_listing(key, contact, item, arts, price, updater.APP_VERSION, picture=pic if pim else None)
                 self.net_q.put(("msg", (f"Listed {item} for {price:g} KK on the market.", GOOD)))
                 self.market_at = 0.0
             self._bg(job)
@@ -2308,6 +2429,8 @@ class App:
         elif kind == "restart":
             self._close()
             return "stop"
+        elif kind == "picture":
+            self._picture_loaded(*data)
         elif kind == "seller":
             self.seller_name = (data or {}).get("name", "") if data and data.get("active") else ""
             if not data:
@@ -2999,6 +3122,7 @@ class App:
         self.icons.clear()
         self.slot_arts.clear()
         self.slot_names.clear()
+        self.slot_pics.clear()
         self.mark_colors.clear()
         self._refresh_overlay()
         if hasattr(self, "tiles"):
@@ -3070,6 +3194,11 @@ class App:
                 kind, data = self.result_q.get_nowait()
             except queue.Empty:
                 break
+            if kind == "pic":
+                seq, slot, pic = data
+                if self.seq_sig.get(seq, (None,))[0] == slot:
+                    self.slot_pics[slot] = pic
+                continue
             if kind == "error":
                 self.raw.delete("1.0", "end")
                 self.raw.insert("end", "ERROR: " + data)
@@ -3121,6 +3250,8 @@ class App:
 
         # hovering the same item again adds to what was read before instead of replacing it
         got = self.slot_arts.get(slot, {}) if same_item else {}
+        if not same_item:
+            self.slot_pics.pop(slot, None)
         for b, v in found:
             got.setdefault(b, v)
         self.slot_arts[slot] = got

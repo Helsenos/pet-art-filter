@@ -673,8 +673,9 @@ class FontReader:
         debug = [t if t else "?" for _, _, t in out]
         if want_box:
             box = None
-            if lines:
-                box = (min(l["x0"] for l in lines), min(l["y"] for l in lines),
-                       max(l["x1"] for l in lines), max(l["y"] for l in lines) + LINE_H)
+            used = lines[:len(out)]       # name ... [Pet Artifact] (reading stops there)
+            if used:
+                box = (min(l["x0"] for l in used), min(l["y"] for l in used),
+                       max(l["x1"] for l in used), max(l["y"] for l in used) + LINE_H)
             return name, arts, debug, box
         return name, arts, debug

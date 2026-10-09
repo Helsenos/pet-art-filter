@@ -9,6 +9,7 @@ anything goes through functions that check a secret:
   * the admin key (only on the admin's PC, file admin.key) allows publishing
     official presets. Only its hash is stored in the database.
 """
+import base64
 import hashlib
 import json
 import os
@@ -114,10 +115,28 @@ def my_listings(code):
     return _rpc("my_listings", p_secret=code) or []
 
 
-def add_listing(code, contact, item, bonuses, price_kk, version):
-    """bonuses: [(name, value), ...]. The seller name comes from the seller account."""
-    return _rpc("add_listing", p_code=code, p_contact=contact, p_item=item,
-                p_bonuses=[[b, v] for b, v in bonuses], p_price=price_kk, p_version=version)
+def add_listing(code, contact, item, bonuses, price_kk, version, picture=None):
+    """bonuses: [(name, value), ...]; picture: small WebP of the tooltip (bytes) or None.
+    The seller name comes from the seller account."""
+    args = dict(p_code=code, p_contact=contact, p_item=item, p_bonuses=[[b, v] for b, v in bonuses],
+                p_price=price_kk, p_version=version)
+    if picture:
+        args["p_picture"] = base64.b64encode(picture).decode("ascii")
+    return _rpc("add_listing", **args)
+
+
+MAX_PICTURE = 40000
+
+
+def listing_picture(listing_id):
+    """-> WebP bytes of a listing's tooltip picture, or None."""
+    data = _rpc("listing_picture", p_id=listing_id)
+    if not isinstance(data, str) or len(data) > MAX_PICTURE * 4 // 3 + 8:
+        return None
+    try:
+        return base64.b64decode(data, validate=True)
+    except ValueError:
+        return None
 
 
 def remove_listing(code, listing_id):
