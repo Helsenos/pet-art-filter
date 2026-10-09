@@ -12,6 +12,7 @@ Instead of general OCR, this learns what the game's own font looks like:
 Anything it isn't sure about is read once by RapidOCR (the "teacher") and learned,
 so the more pet arts you hover the less the teacher is needed.
 """
+import hashlib
 import os
 import pickle
 import re
@@ -40,8 +41,8 @@ VALUE_TOKEN = re.compile(r"^\+?\d{1,3}(,\d{3})*%?$")
 
 
 # ================================================================ image -> text layer
-def text_layer(rgb):
-    """HxWx3 -> HxW float 0..1: how much each pixel looks like tooltip text."""
+def text_layer_exact(rgb):
+    """HxWx3 -> HxW float 0..1: how much each pixel looks like tooltip text (reference)."""
     h, w = rgb.shape[:2]
     keep = np.zeros(h * w, np.float32)
     flat = rgb.reshape(-1, 3)
@@ -59,6 +60,40 @@ def text_layer(rgb):
         best = np.maximum(best, np.where(ok, np.minimum(s_, 1.0), 0))
     keep[idx] = best
     return keep.reshape(h, w)
+
+
+def _build_lut():
+    """Text-ness of every possible colour (16.7 million), exact, stored as 0..255.
+    Built once (about a second); then reading a pixel is a single table lookup."""
+    lut = np.empty(1 << 24, np.uint8)
+    rg = np.arange(1 << 16, dtype=np.uint32)
+    r = (rg >> 8).astype(np.uint8)
+    g = (rg & 255).astype(np.uint8)
+    for b in range(256):                      # one blue value at a time: 65536 colours
+        rgb = np.stack([r, g, np.full_like(r, b)], -1).reshape(-1, 1, 3)
+        lut[(rg << 8) | b] = np.round(text_layer_exact(rgb).ravel() * 255).astype(np.uint8)
+    return lut
+
+
+_LUT = None
+_LUT_LOCK = threading.Lock()
+
+
+def _lut():
+    global _LUT
+    if _LUT is None:
+        with _LUT_LOCK:
+            if _LUT is None:
+                _LUT = _build_lut()
+    return _LUT
+
+
+def text_layer(rgb):
+    """HxWx3 -> HxW float 0..1: how much each pixel looks like tooltip text.
+    One table lookup per pixel (the colour maths is done once for every colour)."""
+    c = rgb.astype(np.uint32)
+    idx = (c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]
+    return _lut()[idx].astype(np.float32) * (1 / 255)
 
 
 def _remove_borders(layer):
@@ -89,14 +124,12 @@ def find_frame(layer, cx):
     the slot. -> (left, right, top, bottom) in layer coordinates, or None."""
     on = layer > 0.2
     h, w = on.shape
-    run = np.zeros(w, np.int32)
-    best = np.zeros(w, np.int32)
-    end = np.zeros(w, np.int32)
-    for y in range(h):
-        run = np.where(on[y], run + 1, 0)
-        upd = run > best
-        best = np.where(upd, run, best)
-        end = np.where(upd, y, end)
+    # length of the vertical run ending at each pixel: rows counted so far minus the row
+    # count at the last "off" pixel above it
+    c = np.cumsum(on, axis=0, dtype=np.int32)
+    run = c - np.maximum.accumulate(np.where(on, 0, c), axis=0)
+    best = run.max(0)
+    end = run.argmax(0).astype(np.int32)
     cand = [x for x in range(w) if 200 <= best[x] <= 520]
     pick, score = None, -1e9
     for l in cand:
@@ -187,8 +220,22 @@ def _wwin(col):
 def _batch_diff(q, stack):
     """Difference of picture q (H x wq) to every picture in stack (n x H x ws):
     worst 4-column window, best over shifting either side by 0..2 px."""
+    best = _batch_diff1(q, stack, 0, 0)
+    near = np.flatnonzero(best < SHIFT_GATE)
+    if len(near) == 0:
+        return best
+    sub_ = stack[near]
+    for sq, ss in ((1, 0), (0, 1), (2, 0), (0, 2)):
+        best[near] = np.minimum(best[near], _batch_diff1(q, sub_, sq, ss))
+    return best
+
+
+SHIFT_GATE = 0.8   # pictures this different unshifted never get close enough by shifting
+
+
+def _batch_diff1(q, stack, sq, ss):
     best = None
-    for sq, ss in ((0, 0), (1, 0), (0, 1), (2, 0), (0, 2)):
+    for sq, ss in ((sq, ss),):
         a, b = q[:, sq:], stack[:, :, ss:]
         wa, wb = a.shape[1], b.shape[2]
         m = min(wa, wb)
@@ -266,6 +313,8 @@ class FontReader:
         self.stats = {"fast": 0, "taught": 0}
         self._ver = 0
         self._idx = (None, None)
+        self._cache = {}     # exact line picture -> fast-path answer (cleared when something is learned)
+        self._cache_ver = 0
         self._load()
 
     # ---- persistence
@@ -354,7 +403,22 @@ class FontReader:
         return self._read_glyphs(pic, gidx) if USE_DP else None
 
     def _classify(self, ln):
-        """Fast path -> (kind, payload, text); kind None = not sure."""
+        """Fast path -> (kind, payload, text); kind None = not sure. Identical line pictures
+        (very common: base stats, frequent bonus lines) are answered from a cache."""
+        if self._cache_ver != self._ver:
+            self._cache, self._cache_ver = {}, self._ver
+        key = hashlib.blake2b(ln["img"].tobytes() + repr(ln["words"]).encode() +
+                              repr(ln["img"].shape).encode(), digest_size=16).digest()
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        res = self._classify_uncached(ln)
+        if len(self._cache) > 20000:
+            self._cache.clear()
+        self._cache[key] = res
+        return res
+
+    def _classify_uncached(self, ln):
         img, words = _clean(ln["img"]), ln["words"]
         lidx, nidx, _, _ = self._indexes()
         k = lidx.best(img, NAME_TOL)
