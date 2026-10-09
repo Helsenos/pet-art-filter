@@ -33,6 +33,8 @@ def configured():
 def _req(method, path, body=None, params=None):
     if not configured():
         raise CloudError("The online market isn't connected yet.")
+    if not SUPABASE_URL.lower().startswith("https://"):
+        raise CloudError("Market URL must use https.")
     url = SUPABASE_URL.rstrip("/") + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -53,6 +55,8 @@ def _req(method, path, body=None, params=None):
         raise CloudError(msg[:200])
     except urllib.error.URLError as e:
         raise CloudError(f"No connection to the market ({e.reason}).")
+    except (OSError, ValueError) as e:   # timeouts, connection resets, bad JSON
+        raise CloudError(f"Market request failed ({type(e).__name__}).")
 
 
 def _rpc(fn, **args):
@@ -71,8 +75,10 @@ def load_key(path, create=True):
     if not create:
         return None
     k = secrets.token_urlsafe(32)
-    with open(path, "w", encoding="utf-8") as fh:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:   # write + rename: a crash can't leave an empty key
         fh.write(k)
+    os.replace(tmp, path)
     return k
 
 
