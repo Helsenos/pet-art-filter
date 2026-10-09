@@ -42,6 +42,7 @@ SPECK_RATIO = 0.62 # ...and the best name is clearly better than any other (d1 <
 GLYPH_SPECK = True
 PREFIX_MATCH = True  # speck-proof fallback for bonus lines (see _prefix_match) # characters may use the speck-tolerant match too
 MAX_PICS = 6
+CLEAN_V = 1        # memory saved by this version is already cleaned: no need to check it at start
 VALUE_TOKEN = re.compile(r"^\+?\d{1,3}(,\d{3})*%?$")
 
 
@@ -468,9 +469,12 @@ class FontReader:
             self.names = d.get("names", {})
             self.tokens = d.get("tokens", {})
             self.glyphs = d.get("glyphs", {})
+            clean_v = d.get("clean_v")
         except Exception:
-            pass
-        if self.clean_memory():          # something was thrown out: keep it that way
+            clean_v = None
+        if clean_v == CLEAN_V and self.keep_text is not None:
+            return                       # cleaned before (and learning keeps it clean)
+        if self.clean_memory() or clean_v != CLEAN_V:          # check once, then remember
             try:
                 self.save()
             except Exception:
@@ -478,7 +482,8 @@ class FontReader:
 
     def save(self):
         with self.lock:
-            data = pickle.dumps({"names": self.names, "tokens": self.tokens, "glyphs": self.glyphs})
+            data = pickle.dumps({"names": self.names, "tokens": self.tokens, "glyphs": self.glyphs,
+                                 "clean_v": CLEAN_V if self.keep_text is not None else None})
         with self._save_lock:          # several reader threads may learn at the same moment
             tmp = f"{self.path}.{threading.get_ident()}.tmp"
             with open(tmp, "wb") as fh:

@@ -41,6 +41,11 @@ def _fast_scrollbar_set(self, start_value, end_value):
     if (start_value, end_value) == (getattr(self, "_start_value", None), getattr(self, "_end_value", None)):
         return
     self._start_value, self._end_value = start_value, end_value
+    try:
+        if not self.winfo_viewable():   # hidden (e.g. while the app is being built): drawn when shown
+            return
+    except Exception:
+        return
     self._draw(no_color_updates=True)
 
 
@@ -1150,27 +1155,27 @@ class Intro:
         ms = (time.perf_counter() - self.t0) * 1000
         cv, (cx, cy) = self.cv, self.GEM_C
         if self.frames:                                         # one soft pulse (0 - 420 ms)
-            cv.itemconfigure(self.gem, image=self.frames[min(11, int(ms / 420 * 11))])
-        t = (ms - 60) / 560                                     # ring of light around the gem
+            cv.itemconfigure(self.gem, image=self.frames[min(11, int(ms / 260 * 11))])
+        t = (ms - 30) / 340                                     # ring of light around the gem
         if 0 <= t <= 1:
             r = 64 + 22 * (1 - (1 - t) ** 3)
             cv.coords(self.ring, cx - r, cy - r, cx + r, cy + r)
             cv.itemconfigure(self.ring, outline=self._mix(ACCENT, self.bgcol, t), width=max(1, int(5 * (1 - t))))
         else:
             cv.coords(self.ring, 0, 0, 0, 0)
-        for k, (dx, dy, delay) in enumerate(((78, -50, 140), (-84, 34, 260), (66, 52, 380))):
-            st = (ms - delay) / 360                             # sparkles twinkle
+        for k, (dx, dy, delay) in enumerate(((78, -50, 60), (-84, 34, 130), (66, 52, 200))):
+            st = (ms - delay) / 220                             # sparkles twinkle
             r = 10 * math.sin(math.pi * min(1.0, max(0.0, st)))
             self._star(self.stars[k], cx + dx, cy + dy, max(0.1, r))
             cv.itemconfigure(self.stars[k], fill="#ffffff" if 0 < st < 1 else self.bgcol)
-        if ms > 330 and self.sub_item is None:                  # loaded: show the version
+        if ms > 120 and self.sub_item is None:                  # loaded: show the version
             self.sub_item = cv.create_image(20, 234, anchor="nw", image=self._sub)
-        if ms < 760:
+        if ms < 420:
             self.win.after(15, self._tick)
         else:
             self.on_done(self)
 
-    def fade_out(self, ms=260):
+    def fade_out(self, ms=160):
         t0 = time.perf_counter()
 
         def step():
@@ -3708,7 +3713,7 @@ class App:
         t0 = time.perf_counter()
 
         def step():
-            t = min(1.0, (time.perf_counter() - t0) / 0.26)
+            t = min(1.0, (time.perf_counter() - t0) / 0.16)
             r.attributes("-alpha", t)
             if t < 1:
                 r.after(15, step)
@@ -3735,7 +3740,7 @@ class App:
 
         def step():
             try:
-                t = min(1.0, (time.perf_counter() - t0) / 0.2)
+                t = min(1.0, (time.perf_counter() - t0) / 0.15)
                 self.root.attributes("-alpha", 1 - t)
                 if t < 1:
                     self.root.after(15, step)
