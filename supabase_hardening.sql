@@ -1,7 +1,8 @@
 -- =====================================================================
 -- Pet Art Filter - security hardening (run AFTER supabase_sellers.sql)
 -- Paste this whole file into Supabase -> SQL Editor -> New query -> Run.
--- Safe to run again.
+-- Safe to run again - but if you do, run supabase_pictures.sql again afterwards
+-- (this file has the older add_listing without pictures).
 --  * bonus values must be numbers, bonus names must be real pet art bonuses
 --  * no invisible / direction-flipping characters in listing text (name spoofing)
 --  * a seller can create at most 200 listings a day, the whole market 30 a minute

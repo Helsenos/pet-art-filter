@@ -481,10 +481,10 @@ class FontReader:
                 pass
 
     def save(self):
-        with self.lock:
-            data = pickle.dumps({"names": self.names, "tokens": self.tokens, "glyphs": self.glyphs,
-                                 "clean_v": CLEAN_V if self.keep_text is not None else None})
         with self._save_lock:          # several reader threads may learn at the same moment
+            with self.lock:
+                data = pickle.dumps({"names": self.names, "tokens": self.tokens, "glyphs": self.glyphs,
+                                     "clean_v": CLEAN_V if self.keep_text is not None else None})
             tmp = f"{self.path}.{threading.get_ident()}.tmp"
             with open(tmp, "wb") as fh:
                 fh.write(data)
@@ -508,7 +508,7 @@ class FontReader:
         low = text.lower()
         flat = re.sub(r"[^a-z0-9]", "", low)            # "Max.SP" == "Max. SP"
         return any(b.lower() in low or flat.startswith(re.sub(r"[^a-z0-9]", "", b.lower()))
-                   for b in self.names if b[0] not in "#=")
+                   for b in list(self.names) if b[0] not in "#=")
 
     def clean_memory(self):
         """Forget pictures learned from teacher misreads: value pictures that don't look like
@@ -537,7 +537,7 @@ class FontReader:
         return n + len(bad)
 
     def known(self):
-        return sum(1 for k in self.names if k[0] not in "#="), len(self.tokens)
+        return sum(1 for k in list(self.names) if k[0] not in "#="), len(self.tokens)
 
     def _indexes(self):
         """(lines, bonus names, values, glyphs) indexes, rebuilt when something was learned."""
@@ -758,10 +758,12 @@ class FontReader:
                 seen = self._read_glyphs(vpic, self._indexes()[3])
                 if seen and seen.lstrip("+") != vtok.lstrip("+"):
                     return None, None
+                segs = _segments((vpic > 0.35).any(0), 1)
+                if not seen and len(segs) != len(vtok):
+                    return None, None      # can't be checked (e.g. "+17%" misread as "+7%"): skip
                 with self.lock:
                     self._add(self.names, bonus, npic)
                     self._add(self.tokens, vtok, vpic)
-                    segs = _segments((vpic > 0.35).any(0), 1)
                     if len(segs) == len(vtok):
                         for (a, b), ch in zip(segs, vtok):
                             lst = self.glyphs.setdefault(ch, [])
@@ -778,7 +780,7 @@ class FontReader:
             if not nums or not any(self._clean_number(text, t) and _num(t) == value for t in nums):
                 return None, None
             return ("bonus", (bonus, value)) if lo <= value <= hi else (None, None)
-        if arts_zone or (key[0] == "=" and self._is_bonus_text(key[1:])):
+        if key[0] == "=" and (arts_zone or self._is_bonus_text(key[1:])):
             return None, None      # a bonus line the teacher misread: don't remember it as text
         if key[0] == "=" and self.keep_text is not None and not self.keep_text(key[1:]):
             return "text", key[1:]  # not worth remembering (e.g. another item's description)
@@ -794,7 +796,7 @@ class FontReader:
         out, learned = [], False
         arts_zone = False                          # after "Defense against Magic Power": the 7 bonuses
         for i, ln in enumerate(lines):
-            if i >= 3 and not any(k == "#plvl" for k, _, _ in out):
+            if i >= 3 and not any(k == "#plvl" or k is None for k, _, _ in out[:3]):
                 break      # not a pet art (its 2nd line is always "From PLvl"): don't read the rest
             kind, payload, text = self._classify(ln)
             if kind is None:                       # icon specks? look again in the line's own colour
@@ -849,7 +851,7 @@ class FontReader:
             if kind == "bonus" and payload[0] not in seen:
                 seen.add(payload[0])
                 arts.append(payload)
-        debug = [t if t else "?" for _, _, t in out]
+        debug = [k if k and k[0] == "#" else (t or "?") for k, _, t in out]
         if want_box:
             box = None
             used = lines[:len(out)]       # name ... [Pet Artifact] (reading stops there)

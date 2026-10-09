@@ -610,7 +610,6 @@ class Scanner(threading.Thread):
         self.delay = delay_ms / 1000.0
         self.ocr_q, self.event_q = ocr_q, event_q
         self.stop_evt = threading.Event()
-        self.seq = 0
 
     def stop(self):
         self.stop_evt.set()
@@ -620,7 +619,17 @@ class Scanner(threading.Thread):
             user32.ShowWindowAsync(hw, 8)   # SW_SHOWNA: back, no focus change
         self._hidden = []
 
+    seq = 0        # numbers keep counting across scans (old numbers stay unique)
+
     def run(self):
+        while not self.stop_evt.is_set():
+            try:
+                self._run()
+            except Exception:
+                self._show_overlay()
+                time.sleep(0.5)   # screen can't be captured right now (e.g. lock screen): retry
+
+    def _run(self):
         vx, vy, vw, vh = virtual_screen()
         cur, entered, grabbed = None, 0.0, False
         with MSS() as sct:
@@ -676,8 +685,8 @@ class Scanner(threading.Thread):
                     img = Image.frombytes("RGB", shot.size, shot.rgb)
                     if hide:
                         self._show_overlay()
-                    self.seq += 1
-                    self.ocr_q.put((self.seq, cur, img, cx - left, same_item, max(0, int(y0) - top - 4)))
+                    Scanner.seq += 1
+                    self.ocr_q.put((Scanner.seq, cur, img, cx - left, same_item, max(0, int(y0) - top - 4)))
                     self.event_q.put(("grabbed", cur))
                 time.sleep(0.004)
 
@@ -945,7 +954,9 @@ class Overlay:
             if self.ticks % 15 == 0 and self.cover != "all":
                 self.win.attributes("-topmost", True)      # stay above the game (it runs as admin)
         except tk.TclError:
-            return
+            return                                       # window gone (closing)
+        except Exception:
+            pass                                         # e.g. an odd colour: skip this frame, keep going
         self.win.after(60, self._tick)
 
     @staticmethod
@@ -963,7 +974,9 @@ class Overlay:
     def flash(self, slot):
         self.flash_slot = slot
         self.redraw()
-        self.win.after(2500, lambda: (setattr(self, "flash_slot", None), self.redraw()))
+        if getattr(self, "_flash_job", None):
+            self.win.after_cancel(self._flash_job)
+        self._flash_job = self.win.after(2500, lambda: (setattr(self, "flash_slot", None), self.redraw()))
 
     def redraw(self):
         grids, marks, show_grid, show_scanned = self.state
@@ -1499,6 +1512,9 @@ class App:
                                    image=self._gear["on" if on else "off"])
         if key == "market" and time.time() - self.market_at > 60:
             self._market_refresh()
+        if key == "settings" and not getattr(self, "_style_preview_on", True):
+            self._style_preview_on = True
+            self._style_preview()
 
     # ------------------------------------------------------------ animations
     def _animate(self, name, ms, step, done=None):
@@ -1821,9 +1837,22 @@ class App:
     def _new_id(self):
         return secrets.token_hex(4)
 
+    @staticmethod
+    def _valid_official(o):
+        """An official preset row as the app expects it (rows come from the server)."""
+        try:
+            d = o.get("data") or {}
+            return (isinstance(o, dict) and isinstance(o.get("id"), str) and isinstance(o.get("name", ""), str)
+                    and isinstance(d, dict) and isinstance(d.get("bonuses", {}), dict)
+                    and all(isinstance(k, str) and isinstance(v, dict) for k, v in d.get("bonuses", {}).items()))
+        except Exception:
+            return False
+
     def _all_profiles(self):
         out = [dict(p, official=False) for p in self.profiles]
         for o in self.official:
+            if not self._valid_official(o):
+                continue
             d = o.get("data") or {}
             col = o.get("color", "rainbow")
             if col != "rainbow" and not _re_hex.match(str(col)):
@@ -1981,6 +2010,7 @@ class App:
             dot = ctk.CTkButton(pill, text="●", width=26, height=26, corner_radius=13,
                                 fg_color="transparent", hover_color=BORDER, text_color=_swatch(p["color"]),
                                 font=self.f(16), command=lambda pid=p["id"]: self._toggle_profile(pid))
+            dot._keep_colors = True        # shows the preset's own colour (white stays white)
             dot.pack(side="left", padx=(4, 0), pady=2)
             name = ctk.CTkButton(pill, text=("★ " if p["official"] else "") + p["name"], height=26,
                                  fg_color="transparent", hover_color=BORDER, text_color=FG,
@@ -2239,9 +2269,15 @@ class App:
                 self.market_mine = []
                 self._render_market()
                 return
-            self._bg(lambda: self.net_q.put(("mine", cloud.my_listings(key))))
+            self._bg(lambda: self._market_job("mine", lambda: cloud.my_listings(key)))
         else:
-            self._bg(lambda: self.net_q.put(("market", cloud.market())))
+            self._bg(lambda: self._market_job("market", cloud.market))
+
+    def _market_job(self, kind, fetch):
+        try:
+            self.net_q.put((kind, fetch()))
+        except Exception as e:
+            self.net_q.put(("market_failed", str(e) if isinstance(e, cloud.CloudError) else type(e).__name__))
 
     # ------------------------------------------------------------ seller code (invite-only selling)
     def _seller_code_dialog(self, then=None):
@@ -2278,9 +2314,9 @@ class App:
             def job():
                 try:
                     info = cloud.seller_check(code)
-                except cloud.CloudError as ex:
-                    info = {"error": str(ex)}
-                self.root.after(0, lambda: done(code, info))
+                except Exception as ex:
+                    info = {"error": str(ex) if isinstance(ex, cloud.CloudError) else type(ex).__name__}
+                self.net_q.put(("call", lambda: done(code, info)))
             threading.Thread(target=job, daemon=True).start()
 
         def done(code, info):
@@ -2474,6 +2510,9 @@ class App:
             try:
                 with open(path, "rb") as fh:
                     data = fh.read(cloud.MAX_PICTURE + 1)
+                if open_picture(data) is None:
+                    os.remove(path)
+                    raise OSError("broken cached picture")
             except OSError:
                 try:
                     data = cloud.listing_picture(lid)
@@ -2487,7 +2526,8 @@ class App:
     def _picture_loaded(self, lid, im):
         self.pic_wanted.discard(lid)
         img = ctk.CTkImage(im, size=im.size) if im is not None else None
-        self.pic_cache[lid] = img
+        if img is not None:
+            self.pic_cache[lid] = img        # failures aren't remembered: tried again next refresh
         lbl = self.pic_labels.pop(lid, None)
         if lbl is not None and lbl.winfo_exists():
             if img is not None:
@@ -2588,7 +2628,7 @@ class App:
                 raw = raw.replace(",", ".")            # 2,5 -> 2.5
             try:
                 price = float(raw)
-                ok = math.isfinite(price) and 0 < price <= 10_000_000 and raw.count(".") <= 1
+                ok = math.isfinite(price) and 0.1 <= round(price, 1) <= 10_000_000 and raw.count(".") <= 1
             except ValueError:
                 ok = False
             if not ok:
@@ -2661,7 +2701,8 @@ class App:
         if info:
             self.upd_lbl.configure(text=f"⬆  Version {info['version']} is available (you have "
                                    f"v{updater.APP_VERSION})", text_color=ACCENT)
-            self.upd_btn.configure(state="normal", text="Update now")
+            if not getattr(self, "_updating", False):
+                self.upd_btn.configure(state="normal", text="Update now")
         else:
             self.upd_lbl.configure(text=f"You have v{updater.APP_VERSION}.", text_color=FG)
             self.upd_btn.configure(state="disabled", text="Update now")
@@ -2708,6 +2749,9 @@ class App:
         if not updater.can_self_update():
             webbrowser.open(f"https://github.com/{updater.UPDATE_REPO}/releases/latest")
             return
+        if getattr(self, "_updating", False):
+            return
+        self._updating = True
         self.upd_btn.configure(state="disabled", text="Downloading…")
 
         def job():
@@ -2773,6 +2817,7 @@ class App:
             self._set_status(data, ACCENT)
             self.upd_lbl.configure(text=data, text_color=ACCENT)
         elif kind == "update_failed":
+            self._updating = False
             self._set_status(data, BAD)
             self._render_update_card()
             self.upd_lbl.configure(text=f"{data}\nYou can download it from the download page instead.",
@@ -2786,15 +2831,20 @@ class App:
             self.upd_lbl.configure(text=f"{msg}\nDetails: {detail}", text_color=WARN)
             self.upd_page_btn.pack(side="left")     # the browser usually still gets through
         elif kind == "official":
-            self.official = data or []
+            self.official = [o for o in (data or []) if self._valid_official(o)]
             if self.current and self.current.startswith("o:") and not self._find_profile(self.current):
                 self.current = None
                 self._select_profile(self.profiles[0]["id"])
             self._save()
             self._render_presets()
             self._recheck()
+        elif kind == "market_failed":
+            self.market_info.configure(text=f"Couldn’t load the market: {data}  –  try ↻ Refresh.", text_color=WARN)
+        elif kind == "call":            # a function to run on the UI thread
+            data()
         elif kind == "update":
             self.update_info = data
+            self.upd_page_btn.pack_forget()
             self._render_update_card()
             self._maybe_update_popup()
         elif kind == "restart":
@@ -2921,7 +2971,7 @@ class App:
         self._strip_img = ImageTk.PhotoImage(rainbow_strip(self._strip_w, self._strip_h))
         self.strip.create_image(self._strip_pad, self._strip_pad, image=self._strip_img, anchor="nw")
         self._strip_edge = self.strip.create_oval(0, 0, 1, 1, width=1, outline="#3a4050")   # visible on light too
-        self._strip_ring = self.strip.create_oval(0, 0, 1, 1, width=3, outline="#ffffff")
+        self._strip_ring = self.strip.create_oval(0, 0, 1, 1, width=3, outline="#fffffe")   # not a theme colour
         self._strip_job = None
         for ev in ("<Button-1>", "<B1-Motion>"):
             self.strip.bind(ev, self._strip_drag)
@@ -2950,7 +3000,7 @@ class App:
         self._style_cv.pack(side="right", anchor="n", padx=(16, 0))
         self._style_cv._keep_colors = True
         self._style_phase = 0.0
-        self._style_preview()
+        self._style_preview_on = False
 
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
                         "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
@@ -2967,7 +3017,8 @@ class App:
         mb.pack(fill="x", padx=28, pady=(0, 16))
         ctk.CTkSwitch(mb, text="Show the mini bar", variable=self.minibar_on, progress_color=ACCENT,
                       font=self.f(13), text_color=FG,
-                      command=lambda: (self.minibar.show(self.minibar_on.get()), self._save())
+                      command=lambda: (self.minibar.show(self.minibar_on.get()), self._save(),
+                                       setattr(self, "_minibar_hidden", False), setattr(self, "_cover", object()))
                       ).pack(anchor="w", padx=18, pady=(4, 16))
 
         lc = self._card(pg, "Font memory", "The app reads tooltips with its memory of your game’s font – "
@@ -3128,9 +3179,12 @@ class App:
         self.overlay.redraw()
 
     def _style_preview(self):
-        """Animated preview of the glow styles (only while Settings is open)."""
+        """Animated preview of the glow styles - runs only while Settings is open."""
         cv = self._style_cv
-        if self._page == "settings" and cv.winfo_exists():
+        if self._page != "settings" or getattr(self, "_closing", False) or not cv.winfo_exists():
+            self._style_preview_on = False
+            return
+        if True:
             cv.delete("all")
             self._style_phase = (self._style_phase + 0.04) % 1.0
             pulse = int(self._style_phase * 25) % 2 == 0
@@ -3187,6 +3241,10 @@ class App:
         if swap:
             self._recolor(swap)
         self._style()
+        try:
+            self.hist.tag_configure("bad", foreground=MUTED)
+        except Exception:
+            pass
         self._gear = {"off": gear_icon(MUTED, 14), "on": gear_icon(FG, 14)}
         self._show_page(self._page, force=True)
         self._mark_accent()
@@ -3406,10 +3464,16 @@ class App:
         self.overlay.win.withdraw()
 
         def shot_then_pick():
-            with MSS() as sct:
-                m = sct.monitors[0]
-                g = sct.grab(m)
-            gray = np.asarray(Image.frombytes("RGB", g.size, g.rgb).convert("L"))
+            try:
+                with MSS() as sct:
+                    m = sct.monitors[0]
+                    g = sct.grab(m)
+                gray = np.asarray(Image.frombytes("RGB", g.size, g.rgb).convert("L"))
+            except Exception as e:
+                self.root.deiconify()
+                self.overlay.win.deiconify()
+                self._set_status(f"Couldn’t take a screenshot ({type(e).__name__}) – try again.", WARN)
+                return
             pick_point(self.root, "Click any slot of your inventory or stash  (Esc = cancel)",
                        lambda pt: self._auto_grid_done(pt, gray, m["left"], m["top"]))
 
@@ -3594,7 +3658,16 @@ class App:
         """Show the window (the .exe's loading picture was up while the app loaded)."""
         self.root.after(50, self._set_taskbar_icon)
         self.root.after(1000, self._set_taskbar_icon)     # once more, to be sure
+        self.root.after(80, lambda: self._move_marker(self._page, False))
         self.root.deiconify()             # straight in: the loading picture covered the wait
+        failed = os.path.join(os.path.dirname(sys.executable), "update_failed.txt")
+        if getattr(sys, "frozen", False) and os.path.exists(failed):
+            try:
+                os.remove(failed)
+            except OSError:
+                pass
+            self.root.after(600, lambda: self._set_status(
+                "The last update couldn’t be installed – try again in Settings, or use the download page.", WARN))
 
     def _close(self):
         """Closing animation: the window fades out (~0.2 s), then the app closes."""
@@ -3782,7 +3855,7 @@ class App:
         if not found:
             if same_item and self.slot_arts.get(slot):
                 return  # tooltip wasn't up this time; keep what we already read
-            if lines and "#plvl" not in lines:
+            if lines and "#plvl" not in lines and "#defense" not in lines and "?" not in lines[:3]:
                 self.marks[slot] = "other"   # some other item: no glow, not read again while it's there
                 return
             self.marks.pop(slot, None)  # empty slot / no tooltip
@@ -3797,12 +3870,16 @@ class App:
             return
         nxt = self.seq_sig.get(seq + 1)
         if nxt and nxt[1] == sig and nxt[0] != slot:
+            self._forget_slot(nxt[0])
             self.marks[nxt[0]] = "missed"
-            self.icons.pop(nxt[0], None)
 
         # hovering the same item again adds to what was read before instead of replacing it
-        got = self.slot_arts.get(slot, {}) if same_item else {}
-        if not same_item:
+        got = dict(self.slot_arts.get(slot, {})) if same_item else {}
+        if got and (any(b in got and got[b] != v for b, v in found)
+                    or len(set(got) | {b for b, _ in found}) > ARTS_PER_PET
+                    or (name and self.slot_names.get(slot) not in (None, pet_name(name)))):
+            got = {}
+        if not got:
             self.slot_pics.pop(slot, None)
         for b, v in found:
             got.setdefault(b, v)
@@ -3820,7 +3897,7 @@ class App:
         matched = self._match_all(found)
         good = bool(matched)
         complete = len(found) >= ARTS_PER_PET
-        if complete and slot[0] < len(self.grids):
+        if complete and slot[0] < len(self.grids) and self.ocr_q.empty():
             x0, y0, x1, y1 = slot_rect(self.grids[slot[0]], slot[2], slot[3])   # slot = (grid, page, row, col)
             if self.game_layer.learn((x0 + x1) / 2, (y0 + y1) / 2):
                 self._save()
@@ -3859,6 +3936,16 @@ class App:
                                    tags=(tag,))
             self.hist_slots[iid] = slot
         self._update_stats()
+
+    def _forget_slot(self, slot):
+        """Drop everything read for a slot (its row in the list too)."""
+        self.icons.pop(slot, None)
+        for d in (self.slot_arts, self.slot_pics, self.mark_colors, self.slot_names):
+            d.pop(slot, None)
+        for iid, s in list(self.hist_slots.items()):
+            if s == slot:
+                self.hist.delete(iid)
+                del self.hist_slots[iid]
 
     def _recheck(self):
         """Re-apply the filter to everything already scanned (after changing the filter)."""
@@ -3910,6 +3997,7 @@ def _selftest():
     ImageDraw.Draw(img).text((4, 1), "Attack Value +40", fill=(225, 250, 225), font=fnt)
     r = font_reader.FontReader(os.path.join(APP_DIR, "selftest.pkl"), lambda t: [], lambda b: (0, 1))
     try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: F401 (updates need it)
         res = "teacher read: " + repr(r._teach_text(np.asarray(img)))
     except Exception as e:
         res = f"teacher FAILED: {type(e).__name__}: {e}"

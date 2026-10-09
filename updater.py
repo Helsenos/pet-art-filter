@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,8 +33,8 @@ USER_AGENT = f"PetArtFilter/{APP_VERSION}"
 
 
 def _ver(v):
-    nums = re.findall(r"\d+", v or "")
-    return tuple(int(n) for n in nums[:3]) + (0,) * (3 - len(nums[:3]))
+    nums = re.findall(r"\d+", v or "")[:4]          # 1.1.10 / hotfix 1.1.10.1
+    return tuple(int(n) for n in nums) + (0,) * (4 - len(nums))
 
 
 def is_newer(remote, local=APP_VERSION):
@@ -75,7 +76,9 @@ def _windows_get(url, limit=4 << 20):
 
 def _parse_release(rel):
     assets = rel.get("assets", [])
-    asset = next((a for a in assets if a.get("name", "").lower().endswith(".zip")), None)
+    ver = rel.get("tag_name", "").lstrip("vV")
+    zips = [a for a in assets if a.get("name", "").lower().endswith(".zip")]
+    asset = next((a for a in zips if a.get("name") == f"Pet.Art.Filter.v{ver}.zip"), zips[0] if zips else None)
     sig = next((a for a in assets if a.get("name", "") == SIG_NAME), None)
     if not asset:
         return None
@@ -146,12 +149,12 @@ def _latest_from_page(timeout):
                                  headers={"User-Agent": USER_AGENT})
     try:
         opener.open(req, timeout=timeout)
-        return None
+        loc = ""                     # no redirect: some filter answered instead of GitHub
     except urllib.error.HTTPError as e:
         loc = e.headers.get("Location", "") if e.code in (301, 302, 303, 307, 308) else ""
     m = re.search(r"/releases/tag/v?(\d+(?:\.\d+){1,3})$", loc)
     if not m:
-        return None
+        raise OSError("release page didn't name a version")
     return _from_version(m.group(1))
 
 
@@ -228,7 +231,18 @@ def download_and_install(info, progress=None):
     if not getattr(sys, "frozen", False):
         raise RuntimeError("self-update only works in the packaged app")
     install_dir = os.path.dirname(sys.executable)
+    if not os.access(install_dir, os.W_OK):
+        raise RuntimeError("the app's folder is read-only (e.g. Program Files) - "
+                           "use the download page or move the app")
     work = tempfile.mkdtemp(prefix="paf_update_")
+    try:
+        return _download_and_install(info, progress, install_dir, work)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def _download_and_install(info, progress, install_dir, work):
     zpath = os.path.join(work, "update.zip")
 
     if not _official(info.get("url")):
@@ -284,21 +298,42 @@ rem wait for Pet Art Filter to close (at most ~60 s)
 set /a TRIES=0
 :wait
 set /a TRIES+=1
-if %TRIES% GTR 60 goto copy
+if %TRIES% GTR 60 goto timeout
 "%TASKLIST%" /FI "PID eq %PAF_PID%" /NH | "%FIND%" "%PAF_PID%" >nul && ("%PING%" -n 2 127.0.0.1 >nul & goto wait)
-:copy
-rem replace only the app's own files
-"%ROBOCOPY%" "%PAF_SRC%\_internal" "%PAF_DST%\_internal" /MIR /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-if %errorlevel% GEQ 8 goto failed
-copy /Y "%PAF_SRC%\%PAF_EXE%" "%PAF_DST%\%PAF_EXE%" >nul || goto failed
+cd /d "%PAF_DST%" || goto failed
+rem leftovers of an interrupted update
+if exist "%PAF_DST%\_internal_old" rmdir /s /q "%PAF_DST%\_internal_old"
+if exist "%PAF_DST%\%PAF_EXE%.old" del /f /q "%PAF_DST%\%PAF_EXE%.old"
+rem move the current version aside (instant, and undone if anything fails)
+set /a TRIES=0
+:aside
+set /a TRIES+=1
+ren "%PAF_DST%\_internal" "_internal_old" 2>nul && goto moved
+if %TRIES% GTR 10 goto failed
+"%PING%" -n 2 127.0.0.1 >nul
+goto aside
+:moved
+ren "%PAF_DST%\%PAF_EXE%" "%PAF_EXE%.old" 2>nul || goto restore
+"%ROBOCOPY%" "%PAF_SRC%\_internal" "%PAF_DST%\_internal" /E /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+if %errorlevel% GEQ 8 goto restore
+copy /Y "%PAF_SRC%\%PAF_EXE%" "%PAF_DST%\%PAF_EXE%" >nul || goto restore
 if exist "%PAF_SRC%\README.txt" copy /Y "%PAF_SRC%\README.txt" "%PAF_DST%\README.txt" >nul
+rmdir /s /q "%PAF_DST%\_internal_old" 2>nul
+del /f /q "%PAF_DST%\%PAF_EXE%.old" 2>nul
 start "" "%PAF_DST%\%PAF_EXE%"
-rmdir /s /q "%PAF_WORK%" 2>nul
-exit /b 0
+rmdir /s /q "%PAF_WORK%" 2>nul & exit /b 0
+:restore
+if exist "%PAF_DST%\_internal_old" rmdir /s /q "%PAF_DST%\_internal" 2>nul
+if exist "%PAF_DST%\_internal_old" ren "%PAF_DST%\_internal_old" "_internal"
+if exist "%PAF_DST%\%PAF_EXE%.old" del /f /q "%PAF_DST%\%PAF_EXE%" 2>nul
+if exist "%PAF_DST%\%PAF_EXE%.old" ren "%PAF_DST%\%PAF_EXE%.old" "%PAF_EXE%"
 :failed
 echo Update could not be installed (files in use?). Starting the current version.> "%PAF_DST%\update_failed.txt"
 start "" "%PAF_DST%\%PAF_EXE%"
-exit /b 1
+rmdir /s /q "%PAF_WORK%" 2>nul & exit /b 1
+:timeout
+echo Update could not be installed: the app didn't close.> "%PAF_DST%\update_failed.txt"
+rmdir /s /q "%PAF_WORK%" 2>nul & exit /b 1
 """)
     env = dict(os.environ, PAF_PID=str(os.getpid()), PAF_SRC=src, PAF_DST=install_dir, PAF_EXE=EXE_NAME,
                PAF_WORK=work)
@@ -306,10 +341,11 @@ exit /b 1
     # the tasklist | find pipe never finishes and the update would hang forever.
     CREATE_NO_WINDOW, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000200, 0x01000000
     cmd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    run = [cmd, "/d", "/c", ".\\" + os.path.basename(script)]     # .\ : found even where cmd skips the current folder
     try:
-        subprocess.Popen([cmd, "/c", script], env=env, close_fds=True,
+        subprocess.Popen(run, cwd=work, env=env, close_fds=True,
                          creationflags=CREATE_NO_WINDOW | NEW_GROUP | BREAKAWAY)
     except OSError:     # not allowed to leave the job (rare): start it inside
-        subprocess.Popen([cmd, "/c", script], env=env, close_fds=True,
+        subprocess.Popen(run, cwd=work, env=env, close_fds=True,
                          creationflags=CREATE_NO_WINDOW | NEW_GROUP)
     return True
