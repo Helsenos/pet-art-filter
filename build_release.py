@@ -25,7 +25,7 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Glows hide while another program (Discord, browser...) is over the game or the game is minimized, and come back when you return to the game
+NOTES = """- Fixed: glows disappeared while scanning. Now only the part of the game covered by another window (or by Pet Art Filter itself) is left out
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
