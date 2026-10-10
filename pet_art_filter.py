@@ -671,12 +671,6 @@ class Scanner(threading.Thread):
                             user32.ShowWindowAsync(hw, 0)
                         dwmapi.DwmFlush()
                         dwmapi.DwmFlush()
-                    if self._looks_empty(sct, cur):      # nothing there: no tooltip to read
-                        if hide:
-                            self._show_overlay()
-                        self.event_q.put(("empty_hover", cur))
-                        time.sleep(0.004)
-                        continue
                     # Already read this slot and the item icon still looks the same?
                     # Then it's the same pet art, skip it.
                     ix, iy = (x1 - x0) * 0.3, (y1 - y0) * 0.3
@@ -954,6 +948,10 @@ class Overlay:
         # only as a whole, and the glows must stay fully bright (created first = below the glows)
         self.shade, self.scv, self.shade_hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
         self.shade.attributes("-alpha", 0.7)
+        user32.ShowWindow(self.shade_hwnd, 0)   # shown only while something is shaded (see _redraw_shade)
+        self._shade_shown = False
+        self._shade_box = None
+        self._layers_hidden = False
         self._shade_sig = None
         self._hover, self._hover_t = None, 0.0
         self.tips = {}           # (grid, row, col) -> screen box of that slot's tooltip
@@ -981,11 +979,14 @@ class Overlay:
                 pass
 
     def hide(self):
+        self._layers_hidden = True
         self.win.withdraw()
-        self.shade.withdraw()
+        user32.ShowWindow(self.shade_hwnd, 0)
 
     def show(self):
-        self.shade.deiconify()
+        self._layers_hidden = False
+        if self._shade_shown:
+            user32.ShowWindow(self.shade_hwnd, 8)     # SW_SHOWNA: never takes the focus from the game
         self.win.deiconify()
 
     def set_shade(self, darkness):
@@ -1031,7 +1032,6 @@ class Overlay:
         return s, [tip]
 
     def _redraw_shade(self, grids, marks, style):
-        ox, oy = self.vx, self.vy
         rects = []
         if self.cover != "all" and style.get("bad") == "Shade":
             hover, holes = self._tip_holes(grids)
@@ -1042,17 +1042,36 @@ class Overlay:
                 if (gi, r, c) != hover and any(x0 < h[2] and h[0] < x1 and y0 < h[3] and h[1] < y1
                                                for h in holes):      # the hovered slot itself stays dark
                     continue
-                rects.append((int(x0 - ox) + 1, int(y0 - oy) + 1, int(x1 - ox) - 1, int(y1 - oy) - 1))
+                rects.append((int(x0) + 1, int(y0) + 1, int(x1) - 1, int(y1) - 1))
         sig = (tuple(rects), self.cover)
         if sig == self._shade_sig:      # unchanged: nothing to redraw (no flicker, no work)
             return
         self._shade_sig = sig
+        # The shade window is see-through as a whole, which Windows has to blend on every frame:
+        # keep it as small as the shaded slots, and switch it off when nothing is shaded.
+        if not rects:
+            if self._shade_shown:
+                user32.ShowWindow(self.shade_hwnd, 0)
+                self._shade_shown = False
+            return
+        # sized to the inventory / stash area - only when that changes (resizing makes it blink)
+        box = (int(min(g["x"] for g in grids)), int(min(g["y"] for g in grids)),
+               int(max(g["x"] + g["w"] for g in grids)) + 1, int(max(g["y"] + g["h"] for g in grids)) + 1)
+        if box != self._shade_box:
+            self._shade_box = box
+            self.shade.geometry(f"{box[2] - box[0]}x{box[3] - box[1]}+{box[0]}+{box[1]}")
+            # (Tk doesn't move a hidden window - Windows does: no z-order change, no focus)
+            user32.SetWindowPos(self.shade_hwnd, 0, box[0], box[1], box[2] - box[0], box[3] - box[1], 0x14)
+        bx0, by0 = box[0], box[1]
         self.scv.delete("all")
-        for box in rects:
-            self.scv.create_rectangle(*box, fill="#000000", outline="")
-        if rects and self.cover and self.cover != "all":
+        for x0, y0, x1, y1 in rects:
+            self.scv.create_rectangle(x0 - bx0, y0 - by0, x1 - bx0, y1 - by0, fill="#000000", outline="")
+        if self.cover and self.cover != "all":
             l, t, r_, b = self.cover
-            self.scv.create_rectangle(l - ox, t - oy, r_ - ox, b - oy, fill=KEY_COLOR, outline=KEY_COLOR, width=0)
+            self.scv.create_rectangle(l - bx0, t - by0, r_ - bx0, b - by0, fill=KEY_COLOR, outline=KEY_COLOR, width=0)
+        if not self._shade_shown and not self._layers_hidden:
+            user32.ShowWindow(self.shade_hwnd, 8)     # SW_SHOWNA: never takes the focus from the game
+            self._shade_shown = True
 
     def _tick(self):
         self.ticks += 1
@@ -1062,7 +1081,8 @@ class Overlay:
         try:
             self.redraw()
             if self.ticks % 15 == 0 and self.cover != "all":
-                self.shade.attributes("-topmost", True)    # stay above the game (it runs as admin)
+                if self._shade_shown:
+                    self.shade.attributes("-topmost", True)    # stay above the game (it runs as admin)
                 self.win.attributes("-topmost", True)
         except tk.TclError:
             return                                       # window gone (closing)
@@ -3999,10 +4019,6 @@ class App:
                 self.marks.pop(slot)
                 self.icons.pop(slot, None)
                 changed = True
-            elif kind == "empty_hover" and slot in self.marks:      # hovered properly: really empty now
-                self.marks.pop(slot)
-                self._forget_slot(slot)
-                changed = True
             elif kind == "page":
                 changed = True
                 self._refresh_grid_list()
@@ -4058,11 +4074,9 @@ class App:
             if lines and "#plvl" not in lines and "#defense" not in lines and "?" not in lines[:3]:
                 self.marks[slot] = "other"   # some other item: no glow, not read again while it's there
                 return
-            if not lines and not same_item and self.marks.get(slot) not in ("good", "bad"):
-                self.marks[slot] = "missed"   # the tooltip wasn't up yet: hover again (icon kept)
-                self._note_read(False)
-                return
-            self.marks.pop(slot, None)  # still nothing with the same icon: no tooltip there
+            if not lines and not same_item:
+                self._note_read(False)       # no tooltip seen (empty slot, or it wasn't up yet)
+            self.marks.pop(slot, None)  # empty slot / no tooltip
             self.icons.pop(slot, None)
             return
         # Same text as the slot hovered just before = the old tooltip was still on
