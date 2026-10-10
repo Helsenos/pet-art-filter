@@ -671,6 +671,12 @@ class Scanner(threading.Thread):
                             user32.ShowWindowAsync(hw, 0)
                         dwmapi.DwmFlush()
                         dwmapi.DwmFlush()
+                    if self._looks_empty(sct, cur):      # nothing there: no tooltip to read
+                        if hide:
+                            self._show_overlay()
+                        self.event_q.put(("empty_hover", cur))
+                        time.sleep(0.004)
+                        continue
                     # Already read this slot and the item icon still looks the same?
                     # Then it's the same pet art, skip it.
                     ix, iy = (x1 - x0) * 0.3, (y1 - y0) * 0.3
@@ -1416,6 +1422,7 @@ class App:
         self.vars = {}
         self.min_matches = tk.IntVar(value=1)
         self.delay_ms = tk.IntVar(value=60)
+        self.hover_ms = tk.IntVar(value=TOOLTIP_DELAY_MS)   # wait on a slot before reading (ms)
         self.cap_width = tk.IntVar(value=480)
         self.cap_above = tk.IntVar(value=520)
         self.cap_below = tk.IntVar(value=480)
@@ -3125,6 +3132,21 @@ class App:
         self._style_phase = 0.0
         self._style_preview_on = False
 
+        sc = self._card(pg, "Reading speed", "How long the app waits on a slot before it reads the tooltip. "
+                        "Lower = you can sweep faster. Too low and the game hasn’t drawn the tooltip yet – those slots "
+                        "simply get the “hover again” dot, never a wrong value. Changes apply right away.")
+        sc.pack(fill="x", padx=28, pady=(0, 16))
+        hrow = ctk.CTkFrame(sc, fg_color="transparent")
+        hrow.pack(fill="x", padx=18, pady=(4, 4))
+        ctk.CTkSlider(hrow, from_=0, to=150, number_of_steps=30, variable=self.hover_ms, width=320,
+                      progress_color=ACCENT, button_color=ACCENT, button_hover_color=ACCENT_H, fg_color=CARD2,
+                      command=lambda _v: self._hover_changed()).pack(side="left")
+        self._hover_lbl = ctk.CTkLabel(hrow, text="", font=self.f(13, "bold"), text_color=FG, anchor="w", width=150)
+        self._hover_lbl.pack(side="left", padx=(12, 0))
+        self._hover_stats = ctk.CTkLabel(sc, text="", font=self.f(12), text_color=MUTED, anchor="w", justify="left")
+        self._hover_stats.pack(fill="x", padx=18, pady=(0, 16))
+        self._hover_text()
+
         rc = self._card(pg, "Screen recording", "Want to record or stream while scanning (NVIDIA, OBS, Xbox Game "
                         "Bar)? Turn this on. Normally the glow is hidden from screenshots so it can’t cover the "
                         "tooltip text the app reads – recorders see that as a “protected application” and "
@@ -3291,6 +3313,25 @@ class App:
     def _careful_changed(self):
         self._careful = bool(self.careful_on.get())
         self._save()
+
+    def _hover_wait(self):
+        return min(150, max(0, self._int(self.hover_ms, TOOLTIP_DELAY_MS)))
+
+    def _hover_text(self):
+        v = self._hover_wait()
+        self._hover_lbl.configure(text=f"{v} ms" + ("  (default)" if v == TOOLTIP_DELAY_MS else ""))
+        log = getattr(self, "_read_log", [])
+        self._hover_stats.configure(
+            text=f"Last {len(log)} reads: {sum(log)} read straight away, {len(log) - sum(log)} needed another hover."
+            if log else "Scan a few pet arts to see how well this works.")
+
+    def _hover_changed(self):
+        self._hover_text()
+        if self.scanner:
+            self.scanner.delay = self._hover_wait() / 1000      # live, no restart
+        if getattr(self, "_hover_job", None):
+            self.root.after_cancel(self._hover_job)
+        self._hover_job = self.root.after(400, self._save)
 
     def _shade_text(self):
         v = self._int(self.shade_dark, 70)
@@ -3500,7 +3541,7 @@ class App:
         self._render_presets()
 
     def _settings(self):
-        return {"min_matches": self.min_matches, "delay_ms": self.delay_ms,
+        return {"min_matches": self.min_matches, "delay_ms": self.delay_ms, "hover_ms": self.hover_ms,
                 "cap_width": self.cap_width, "cap_above": self.cap_above,
                 "cap_below": self.cap_below, "ocr_scale": self.ocr_scale,
                 "show_scanned": self.show_scanned, "recording_friendly": self.rec_mode,
@@ -3751,7 +3792,7 @@ class App:
         self.show_grid.set(False)
         self._refresh_overlay()
         cap = dict(CAPTURE)
-        self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, TOOLTIP_DELAY_MS,
+        self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, self._hover_wait(),
                                self.ocr_q, self.event_q,
                                hide_overlay=((self.overlay.hwnd, self.overlay.shade_hwnd, self.minibar.hwnd),
                                              lambda: self._rec_on))
@@ -3958,6 +3999,10 @@ class App:
                 self.marks.pop(slot)
                 self.icons.pop(slot, None)
                 changed = True
+            elif kind == "empty_hover" and slot in self.marks:      # hovered properly: really empty now
+                self.marks.pop(slot)
+                self._forget_slot(slot)
+                changed = True
             elif kind == "page":
                 changed = True
                 self._refresh_grid_list()
@@ -3995,6 +4040,7 @@ class App:
                 self._status_busy = False
                 self._set_status("Ready")
             if self._page == "settings":        # only while you can see it
+                self._hover_text()
                 names, values = self.reader.known()
                 self.learn_lbl.configure(
                     text=f"Bonus names learned:  {names} / 41\nValues learned:  {values}\n"
@@ -4012,7 +4058,11 @@ class App:
             if lines and "#plvl" not in lines and "#defense" not in lines and "?" not in lines[:3]:
                 self.marks[slot] = "other"   # some other item: no glow, not read again while it's there
                 return
-            self.marks.pop(slot, None)  # empty slot / no tooltip
+            if not lines and not same_item and self.marks.get(slot) not in ("good", "bad"):
+                self.marks[slot] = "missed"   # the tooltip wasn't up yet: hover again (icon kept)
+                self._note_read(False)
+                return
+            self.marks.pop(slot, None)  # still nothing with the same icon: no tooltip there
             self.icons.pop(slot, None)
             return
         # Same text as the slot hovered just before = the old tooltip was still on
@@ -4021,7 +4071,9 @@ class App:
         if prev and prev[1] == sig and prev[0] != slot:
             self.marks[slot] = "missed"
             self.icons.pop(slot, None)
+            self._note_read(False)
             return
+        self._note_read(True)
         nxt = self.seq_sig.get(seq + 1)
         if nxt and nxt[1] == sig and nxt[0] != slot:
             self._forget_slot(nxt[0])
@@ -4094,6 +4146,10 @@ class App:
                                    tags=(tag,))
             self.hist_slots[iid] = slot
         self._update_stats()
+
+    def _note_read(self, ok):
+        """Remember whether a read worked first time (shown next to the reading-speed slider)."""
+        self._read_log = (getattr(self, "_read_log", []) + [ok])[-50:]
 
     def _forget_slot(self, slot):
         """Drop everything read for a slot (its row in the list too)."""
