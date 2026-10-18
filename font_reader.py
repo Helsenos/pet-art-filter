@@ -186,6 +186,18 @@ def find_lines(rgb, cx, y_from=0):
     return _find_lines(rgb, cx)
 
 
+def tooltip_frame(rgb, cx, y_from=0):
+    """Where the tooltip frame is, searched like find_lines: below the slot first, then the
+    whole capture. -> (left, right, top, bottom, found_below_slot) in rgb coordinates, or None."""
+    x0w, x1w = int(max(0, cx - 260)), int(min(rgb.shape[1], cx + 260))
+    for y0 in ((y_from, 0) if y_from > 0 else (0,)):
+        f = find_frame(text_layer_u8(rgb[y0:, x0w:x1w]), cx - x0w)
+        if f and not (y0 and f[2] <= 1):
+            l, r, t, b = f
+            return x0w + l, x0w + r, y0 + t, y0 + b, y0 > 0
+    return None
+
+
 def _find_lines(rgb, cx, need_frame=False):
     h, w = rgb.shape[:2]
     x0w, x1w = int(max(0, cx - 260)), int(min(w, cx + 260))

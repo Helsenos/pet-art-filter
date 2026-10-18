@@ -598,11 +598,16 @@ class PageWatcher(threading.Thread):
 
 
 # ================================================================ scanner
+TIP_STILL_S = 0.25     # mouse resting this long: the tooltip on screen is surely the hovered item's
+TIP_LEARN_S = 0.15     # resting this long: learn where the tooltip sits relative to the mouse
+
+
 class Scanner(threading.Thread):
     """Follows the mouse. Each time it sits on a new slot for `delay` ms, grabs
     the area where the tooltip shows up and queues it for OCR."""
 
-    def __init__(self, grids, pages, icons, marks, cap, delay_ms, ocr_q, event_q, hide_overlay=None):
+    def __init__(self, grids, pages, icons, marks, cap, delay_ms, ocr_q, event_q, hide_overlay=None,
+                 tip_offset=None):
         super().__init__(daemon=True)
         self.hide_overlay = hide_overlay   # ((hwnds), is_on) in screen-recording mode
         self._hidden = []
@@ -610,6 +615,9 @@ class Scanner(threading.Thread):
         self.delay = delay_ms / 1000.0
         self.ocr_q, self.event_q = ocr_q, event_q
         self.stop_evt = threading.Event()
+        # tooltip frame centre / top minus the mouse position; shared with the app, which saves it
+        self.tip_offset = tip_offset if tip_offset is not None else [0.0, None]
+        self._samples = ([], [])
 
     def stop(self):
         self.stop_evt.set()
@@ -633,6 +641,46 @@ class Scanner(threading.Thread):
         except Exception:
             return False
 
+    def _learn_offset(self, dx, dy):
+        for i, v in ((0, dx), (1, dy)):
+            if v is None:
+                continue
+            old = self.tip_offset[i]
+            if old is not None and abs(v - old) > 6 and len(self._samples[i]) >= 5:
+                continue        # tooltip pushed aside by the screen edge: not a normal sample
+            self._samples[i].append(v)
+            del self._samples[i][:-25]
+            if i == 0 or len(self._samples[1]) >= 3:
+                self.tip_offset[i] = float(np.median(self._samples[i]))
+
+    def _old_tooltip(self, img, cx, y_from, origin, rect, mouse, still_for):
+        """The game moves the tooltip with the mouse but draws it a frame or more late. If the
+        tooltip on screen was drawn while the mouse was over a NEIGHBOURING slot, it still shows
+        that slot's pet art -> True (grab again). Unsure -> False."""
+        try:
+            f = font_reader.tooltip_frame(np.asarray(img), cx, y_from)
+        except Exception:
+            return False
+        if f is None or not 180 <= f[1] - f[0] <= 300:
+            return False                   # no tooltip (yet): the reader decides
+        l, r, t, _, below = f
+        fx, fy = origin[0] + (l + r) / 2, origin[1] + t      # on screen
+        mx, my = mouse
+        if still_for >= TIP_LEARN_S:
+            self._learn_offset(fx - mx, fy - my if below and 0 < fy - my < 150 else None)
+        if still_for >= TIP_STILL_S:
+            return False
+        x0, y0, x1, y1 = rect
+        sw, sh = x1 - x0, y1 - y0
+        px = fx - self.tip_offset[0]       # where the mouse was when this tooltip was drawn
+        if x0 - 2 * sw <= px < x0 - 0.5 or x1 + 0.5 <= px < x1 + 2 * sw:
+            return True
+        if below and self.tip_offset[1] is not None:
+            py = fy - self.tip_offset[1]
+            if y0 - 2 * sh <= py < y0 - 0.5 or y1 + 0.5 <= py < y1 + 2 * sh:
+                return True
+        return False
+
     def run(self):
         while not self.stop_evt.is_set():
             try:
@@ -644,17 +692,21 @@ class Scanner(threading.Thread):
     def _run(self):
         vx, vy, vw, vh = virtual_screen()
         cur, entered, grabbed = None, 0.0, False
+        last_pos, moved, retry_at = None, 0.0, 0.0
         with MSS() as sct:
             while not self.stop_evt.is_set():
-                slot = slot_at(self.grids, *cursor_pos())
+                pos = cursor_pos()
+                now = time.perf_counter()
+                if pos != last_pos:
+                    last_pos, moved = pos, now
+                slot = slot_at(self.grids, *pos)
                 if slot is not None:
                     slot = (slot[0], self.pages.get(slot[0], 0), slot[1], slot[2])
-                now = time.perf_counter()
                 if slot != cur:
                     if cur is not None and not grabbed:      # passed too quickly to read it
                         self.event_q.put(("empty" if self._looks_empty(sct, cur) else "missed", cur))
                     cur, entered, grabbed = slot, now, False
-                elif cur is not None and not grabbed and now - entered >= self.delay:
+                elif cur is not None and not grabbed and now - entered >= self.delay and now >= retry_at:
                     gi, pg, r, c = cur
                     tabs = self.grids[gi].get("tabs")
                     if tabs:
@@ -663,7 +715,6 @@ class Scanner(threading.Thread):
                             self.pages[gi] = pg = now_pg
                             cur = (gi, pg, r, c)
                     x0, y0, x1, y1 = slot_rect(self.grids[gi], r, c)
-                    grabbed = True
                     hide = self.hide_overlay and self.hide_overlay[1]()
                     if hide:   # recording mode: take the glow off the screen for one frame
                         self._hidden = [hw for hw in self.hide_overlay[0] if user32.IsWindowVisible(hw)]
@@ -684,9 +735,9 @@ class Scanner(threading.Thread):
                     if same_item and self.marks.get(cur) in ("good", "bad", "other"):
                         if hide:
                             self._show_overlay()
+                        grabbed = True
                         time.sleep(0.004)
                         continue   # same pet art, already fully read
-                    self.icons[cur] = icon
                     cx = (x0 + x1) / 2
                     left = int(max(vx, cx - self.cap["width"] / 2))
                     top = int(max(vy, y0 - self.cap["above"]))
@@ -697,9 +748,15 @@ class Scanner(threading.Thread):
                     img = Image.frombytes("RGB", shot.size, shot.rgb)
                     if hide:
                         self._show_overlay()
+                    y_from = max(0, int(y0) - top - 4)
+                    if self._old_tooltip(img, cx - left, y_from, (left, top), (x0, y0, x1, y1),
+                                         pos, now - moved):
+                        retry_at = time.perf_counter() + 0.008     # the game hasn't caught up: look again
+                        continue
+                    grabbed = True
+                    self.icons[cur] = icon
                     Scanner.seq += 1
-                    self.ocr_q.put((Scanner.seq, cur, img, cx - left, same_item, max(0, int(y0) - top - 4),
-                                    (left, top)))
+                    self.ocr_q.put((Scanner.seq, cur, img, cx - left, same_item, y_from, (left, top)))
                     self.event_q.put(("grabbed", cur))
                 time.sleep(0.004)
 
@@ -3538,6 +3595,8 @@ class App:
         self.official = cfg.get("official_cache", [])
         self.official_on = cfg.get("official_on", {})
         self.seller, self.contact = cfg.get("seller", ""), cfg.get("contact", "")
+        off = cfg.get("tip_offset")      # where the tooltip sits relative to the mouse (learned)
+        self.tip_offset = list(off) if isinstance(off, list) and len(off) == 2 else [0.0, None]
         self._game_exe = cfg.get("game_exe") if isinstance(cfg.get("game_exe"), str) else None
         self.profiles = cfg.get("profiles") or []
         if not self.profiles:   # first start with presets: turn the old single filter into one
@@ -3587,6 +3646,7 @@ class App:
         gl = getattr(self, "game_layer", None)
         cfg["game_exe"] = gl.exe if gl else getattr(self, "_game_exe", None)
         cfg["theme"], cfg["accent"] = self.theme, self.accent
+        cfg["tip_offset"] = getattr(self, "tip_offset", [0.0, None])
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
@@ -3813,7 +3873,7 @@ class App:
         self._refresh_overlay()
         cap = dict(CAPTURE)
         self.scanner = Scanner(self.grids, self.pages, self.icons, self.marks, cap, self._hover_wait(),
-                               self.ocr_q, self.event_q,
+                               self.ocr_q, self.event_q, tip_offset=self.tip_offset,
                                hide_overlay=((self.overlay.hwnd, self.overlay.shade_hwnd, self.minibar.hwnd),
                                              lambda: self._rec_on))
         self.scanner.start()
@@ -3823,6 +3883,7 @@ class App:
         if self.scanner:
             self.scanner.stop()
             self.scanner = None
+            self._save()          # keeps the learned tooltip position
         self._set_scanning(False)
 
     def _clear_marks(self):
@@ -4081,17 +4142,19 @@ class App:
             return
         # Same text as the slot hovered just before = the old tooltip was still on
         # screen. Mark it as missed so it gets swept again.
-        prev = self.seq_sig.get(seq - 1)
-        if prev and prev[1] == sig and prev[0] != slot:
-            self.marks[slot] = "missed"
-            self.icons.pop(slot, None)
-            self._note_read(False)
-            return
+        for k in (1, 2, 3):
+            prev = self.seq_sig.get(seq - k)
+            if prev and prev[1] == sig and prev[0] != slot:
+                self.marks[slot] = "missed"
+                self.icons.pop(slot, None)
+                self._note_read(False)
+                return
         self._note_read(True)
-        nxt = self.seq_sig.get(seq + 1)
-        if nxt and nxt[1] == sig and nxt[0] != slot:
-            self._forget_slot(nxt[0])
-            self.marks[nxt[0]] = "missed"
+        for k in (1, 2, 3):
+            nxt = self.seq_sig.get(seq + k)
+            if nxt and nxt[1] == sig and nxt[0] != slot:
+                self._forget_slot(nxt[0])
+                self.marks[nxt[0]] = "missed"
 
         if tip and slot[0] < len(self.grids):          # the shade keeps tooltips clear
             self.overlay.learn_tip((slot[0], slot[2], slot[3]),
