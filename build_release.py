@@ -25,8 +25,7 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Shade: the dark boxes stay dark under a tooltip - only its text shows through on top, so you
-  still see which pet arts are shaded (screen-recording mode keeps the old behaviour)
+NOTES = """- Shade: back to clearing the shade under the tooltip (the text cut-out from 1.1.13 was unreliable)
 - Results: the "Only good" switch now works on the whole list, and shows the good pet arts
   with their tooltip picture. Click one to show it in the game and pick it for "Sell selected"
 """
