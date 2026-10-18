@@ -25,14 +25,12 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- New gem icon (window, taskbar, shortcut) and a loading picture while the app starts
-- Reads more pet arts: ones with an unclear "From PLvl" line were skipped until F7
-- Fast mouse moves can no longer give a slot the previous item's values (also for selling)
-- Scanning recovers by itself after the lock screen or an admin prompt
-- Updates: if something goes wrong the old version is restored; a failed update is reported;
-  works when GitHub is only reachable through Windows; "Open download page" button
-- Market shows when it can't load; seller check, pictures and price fixes
-- Many smaller fixes (themes, glow animation, grid finder, presets from the server)
+NOTES = """- Fix: sweeping fast could put the glow (and the market picture) of one pet art on the slot
+  next to it - the game draws the tooltip a moment late. The app now checks where the tooltip
+  is on screen and reads it again if it still belongs to the slot you just left
+- Reading speed setting (Settings): how long to wait on a slot before reading, 0-150 ms
+- Shade: not-good pet arts can be darkened with a see-through veil (darkness slider);
+  tooltips stay clear
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
