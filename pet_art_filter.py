@@ -1946,8 +1946,14 @@ class App:
         self._btn(res.header, "◈  Sell selected", self._sell_dialog, kind="accent", width=130,
                   height=30).pack(side="right", padx=(0, 8))
         ctk.CTkSwitch(res.header, text="Only good", variable=self.only_good, progress_color=ACCENT,
-                      font=self.f(12), text_color=FG).pack(side="right", padx=14)
+                      font=self.f(12), text_color=FG, command=self._results_view).pack(side="right", padx=14)
+        self._res_card = res
+        self.gallery = ctk.CTkScrollableFrame(res, fg_color=CARD, corner_radius=0, orientation="horizontal",
+                                              height=215, scrollbar_button_color=CARD2,
+                                              scrollbar_button_hover_color=BORDER)
+        self._gal_sel, self._gal_imgs, self._gal_job = None, {}, None
         tf = ctk.CTkFrame(res, fg_color=CARD, corner_radius=0)
+        self._hist_frame = tf
         tf.pack(fill="both", expand=True, padx=14, pady=(6, 14))
         self.hist = ttk.Treeview(tf, columns=("slot", "name", "v", "b"), show="headings",
                                  style="Modern.Treeview")
@@ -2829,8 +2835,11 @@ class App:
         self._bg(job)
 
     def _sell_dialog(self):
-        sel = self.hist.selection()
-        slot = self.hist_slots.get(sel[0]) if sel else None
+        if self.only_good.get():
+            slot = self._gal_sel if self.marks.get(self._gal_sel) == "good" else None
+        else:
+            sel = self.hist.selection()
+            slot = self.hist_slots.get(sel[0]) if sel else None
         if slot is None:
             self._set_status("Select a pet art in the Results list first.", WARN)
             return
@@ -4150,6 +4159,7 @@ class App:
                 seq, slot, pic = data
                 if self.seq_sig.get(seq, (None,))[0] == slot:
                     self.slot_pics[slot] = pic
+                    self._gallery_later()
                 continue
             if kind == "error":
                 self.raw.delete("1.0", "end")
@@ -4272,14 +4282,14 @@ class App:
             if s == slot:
                 self.hist.delete(iid)
                 del self.hist_slots[iid]
-        if good or not self.only_good.get():
-            result = (("GOOD · " + ", ".join(p["name"] for p in matched)) if good else "no") \
-                if complete else f"X {len(found)}/{ARTS_PER_PET}"
-            tag = ("good" if good else "bad") if complete else "incomplete"
-            iid = self.hist.insert("", 0, values=(self._slot_name(slot), name, result,
-                                                  ",  ".join(f"{b} {v}" for b, v in found)),
-                                   tags=(tag,))
-            self.hist_slots[iid] = slot
+        result = (("GOOD · " + ", ".join(p["name"] for p in matched)) if good else "no") \
+            if complete else f"X {len(found)}/{ARTS_PER_PET}"
+        tag = ("good" if good else "bad") if complete else "incomplete"
+        iid = self.hist.insert("", 0, values=(self._slot_name(slot), name, result,
+                                              ",  ".join(f"{b} {v}" for b, v in found)),
+                               tags=(tag,))
+        self.hist_slots[iid] = slot
+        self._gallery_later()
         self._update_stats()
 
     def _note_read(self, ok):
@@ -4295,6 +4305,7 @@ class App:
             if s == slot:
                 self.hist.delete(iid)
                 del self.hist_slots[iid]
+        self._gallery_later()
 
     def _recheck(self):
         """Re-apply the filter to everything already scanned (after changing the filter)."""
@@ -4320,6 +4331,7 @@ class App:
             good = self.marks.get(slot) == "good"
             self.hist.set(iid, "v", ("GOOD · " + names.get(slot, "")) if good else "no")
             self.hist.item(iid, tags=("good" if good else "bad",))
+        self._gallery_later()
         self._update_stats()
         self._refresh_overlay()
 
@@ -4331,7 +4343,81 @@ class App:
     def _clear_hist(self):
         self.hist.delete(*self.hist.get_children())
         self.hist_slots.clear()
+        self._gallery_later()
         self._update_stats()
+
+    def _results_view(self):
+        """Only good: a strip of the good pet arts with their tooltip pictures. Off: the full table."""
+        if self.only_good.get():
+            self._hist_frame.pack_forget()
+            self.gallery.pack(fill="both", expand=True, padx=14, pady=(6, 14))
+            self._render_gallery()
+        else:
+            self.gallery.pack_forget()
+            self._hist_frame.pack(fill="both", expand=True, padx=14, pady=(6, 14))
+
+    def _gallery_later(self):
+        """Redraw the gallery soon (several results / pictures arrive close together)."""
+        if not self.only_good.get() or self._gal_job:
+            return
+        self._gal_job = self.root.after(250, self._render_gallery)
+
+    def _gallery_pick(self, slot):
+        self._gal_sel = slot
+        self.overlay.flash(slot)
+        self._render_gallery()
+
+    def _render_gallery(self):
+        self._gal_job = None
+        for w in self.gallery.winfo_children():
+            w.destroy()
+        slots = []
+        for iid in self.hist.get_children():         # newest first, like the table
+            slot = self.hist_slots.get(iid)
+            if slot is not None and slot not in slots and self.marks.get(slot) == "good":
+                slots.append(slot)
+        if not slots:
+            ctk.CTkLabel(self.gallery, text="No good pet arts yet – they show up here with their tooltip picture.",
+                         font=self.f(13), text_color=MUTED).pack(side="left", padx=20, pady=40)
+            return
+        for slot in slots:
+            sel = slot == self._gal_sel
+            card = ctk.CTkFrame(self.gallery, fg_color=CARD2, corner_radius=10, border_width=2,
+                                border_color=ACCENT if sel else CARD2)
+            card.pack(side="left", fill="y", padx=(0, 10), pady=4)
+            pic = self.slot_pics.get(slot)
+            img = None
+            if pic:
+                cached = self._gal_imgs.get(slot)
+                if cached and cached[0] is pic:
+                    img = cached[1]
+                else:
+                    pim = open_picture(pic)
+                    if pim:
+                        k = min(1.0, 190 / pim.height)
+                        img = ctk.CTkImage(pim, size=(int(pim.width * k), int(pim.height * k)))
+                        self._gal_imgs[slot] = (pic, img)
+            if img:
+                body = ctk.CTkLabel(card, text="", image=img)
+            else:      # picture not taken (yet): the bonuses instead
+                arts = (self.slot_arts.get(slot) or {}).items()
+                body = ctk.CTkLabel(card, text="\n".join(f"{b}  {v}" for b, v in arts) +
+                                    "\n\n(no picture – hover it once more)", font=self.f(11),
+                                    text_color=FG, justify="left", anchor="nw", width=200, height=190)
+            body.grid(row=0, column=0, rowspan=3, padx=8, pady=8)
+            tags = ", ".join(p["name"] for p in self._match_all(list((self.slot_arts.get(slot) or {}).items())))
+            where = ctk.CTkLabel(card, text=self._slot_name(slot), font=self.f(12, "bold"), text_color=FG,
+                                 anchor="w")
+            where.grid(row=0, column=1, sticky="sw", padx=(0, 12), pady=(14, 0))
+            info = ctk.CTkLabel(card, text=tags, font=self.f(11, "bold"), text_color=GOOD, anchor="nw",
+                                justify="left", wraplength=130)
+            info.grid(row=1, column=1, sticky="nw", padx=(0, 12))
+            hint = ctk.CTkLabel(card, text="selected – Sell selected" if sel else "click: show in game",
+                                font=self.f(10), text_color=ACCENT if sel else MUTED, anchor="w")
+            hint.grid(row=2, column=1, sticky="sw", padx=(0, 12), pady=(0, 12))
+            card.grid_rowconfigure(1, weight=1)
+            for w in (card, body, where, info, hint):
+                w.bind("<Button-1>", lambda _e, s=slot: self._gallery_pick(s))
 
 
 def _selftest():
