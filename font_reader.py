@@ -198,24 +198,6 @@ def tooltip_frame(rgb, cx, y_from=0):
     return None
 
 
-def tooltip_text_mask(rgb, cx, y_from=0):
-    """The tooltip's letters (and frame): bool HxW mask, True on text pixels inside the frame,
-    grown by 1 px for the soft letter edges. -> (mask, (left, top, right, bottom)) or None."""
-    f = tooltip_frame(rgb, cx, y_from)
-    if f is None or not 180 <= f[1] - f[0] <= 300:
-        return None
-    l, r, t, b, _ = f
-    on = text_layer_u8(rgb[t:b + 1, l:r + 1]) >= _U25
-    grown = on.copy()
-    grown[1:] |= on[:-1]
-    grown[:-1] |= on[1:]
-    grown[:, 1:] |= on[:, :-1]
-    grown[:, :-1] |= on[:, 1:]
-    mask = np.zeros(rgb.shape[:2], bool)
-    mask[t:b + 1, l:r + 1] = grown
-    return mask, (l, t, r, b)
-
-
 def _find_lines(rgb, cx, need_frame=False):
     h, w = rgb.shape[:2]
     x0w, x1w = int(max(0, cx - 260)), int(min(w, cx + 260))

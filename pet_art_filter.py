@@ -1000,7 +1000,7 @@ class Overlay:
 
     def __init__(self, root):
         self.vx, self.vy, vw, vh = virtual_screen()
-        self.vw, self.vh = vw, vh
+        self.vh = vh
         # the shade over not-good pet arts is its own layer: Windows makes a window see-through
         # only as a whole, and the glows must stay fully bright (created first = below the glows)
         self.shade, self.scv, self.shade_hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
@@ -1013,10 +1013,6 @@ class Overlay:
         self._hover, self._hover_t = None, 0.0
         self.tips = {}           # (grid, row, col) -> screen box of that slot's tooltip
         self.tip_rel = None      # where tooltips open, relative to the slot (from the last read)
-        self._capture_hidden = True
-        self._sct = None
-        self._cut_pos, self._cut_t, self._cut, self._cut_tries = None, 0.0, None, 0
-        self._cut_img = None
         self.win, self.cv, self.hwnd = _click_through_layer(root, self.vx, self.vy, vw, vh)
         self.set_capture_mode(True)
         self.pulse = False
@@ -1033,7 +1029,6 @@ class Overlay:
         """True: Windows keeps the glow out of every screenshot (best for reading, but
         NVIDIA/OBS then refuse to record: "protected application"). False: recorders work;
         the Scanner hides the glow for one frame while it grabs a tooltip instead."""
-        self._capture_hidden = hide_from_capture
         for hwnd in (self.hwnd, self.shade_hwnd):
             try:
                 user32.SetWindowDisplayAffinity(hwnd, 0x11 if hide_from_capture else 0)
@@ -1093,49 +1088,10 @@ class Overlay:
                    sy1 + CAPTURE["below"])
         return s, [tip]
 
-    def _tip_letters(self):
-        """Mouse resting on a slot: find the tooltip's letters on screen, so they can be cut out
-        of the shade - the shaded slots under the tooltip stay dark behind the text.
-        -> (left, top, mask) on screen, "wait" (not found yet) or None (can't: clear the area)."""
-        if not self._capture_hidden:     # recording mode: a screenshot would see the shade itself
-            return None
-        pos, now = cursor_pos(), time.perf_counter()
-        if pos != self._cut_pos:         # the tooltip moves with the mouse: find it again
-            self._cut_pos, self._cut_t, self._cut, self._cut_tries = pos, now, None, 0
-        if self._cut is not None:
-            return self._cut
-        if now - self._cut_t < 0.12:
-            return "wait"
-        if self._cut_tries >= 5:
-            return None
-        self._cut_tries += 1
-        mx, my = pos
-        left, right = max(self.vx, mx - 200), min(self.vx + self.vw, mx + 200)
-        top, bottom = max(self.vy, my - 560), min(self.vy + self.vh, my + 560)
-        try:
-            if self._sct is None:
-                self._sct = MSS()
-            g = self._sct.grab({"left": left, "top": top, "width": right - left, "height": bottom - top})
-            rgb = np.ascontiguousarray(np.asarray(g)[:, :, 2::-1])
-            res = font_reader.tooltip_text_mask(rgb, mx - left, max(0, my - top - 4))
-        except Exception:
-            res = None
-        if res is None:
-            return "wait" if self._cut_tries < 5 else None
-        self._cut = (left, top, res[0])
-        return self._cut
-
     def _redraw_shade(self, grids, marks, style):
         rects = []
-        cut = None
         if self.cover != "all" and style.get("bad") == "Shade":
             hover, holes = self._tip_holes(grids)
-            if holes:
-                cut = self._tip_letters()
-                if cut is not None:
-                    holes = []           # letters cut out instead (or not found yet: stay dark)
-                    if cut == "wait":
-                        cut = None
             for (gi, pg, r, c), status in marks.items():
                 if status != "bad" or gi >= len(grids) or pg != self.pages.get(gi, 0):
                     continue
@@ -1144,7 +1100,7 @@ class Overlay:
                                                for h in holes):      # the hovered slot itself stays dark
                     continue
                 rects.append((int(x0) + 1, int(y0) + 1, int(x1) - 1, int(y1) - 1))
-        sig = (tuple(rects), self.cover, cut and (cut[0], cut[1], self._cut_pos))
+        sig = (tuple(rects), self.cover)
         if sig == self._shade_sig:      # unchanged: nothing to redraw (no flicker, no work)
             return
         self._shade_sig = sig
@@ -1167,20 +1123,6 @@ class Overlay:
         self.scv.delete("all")
         for x0, y0, x1, y1 in rects:
             self.scv.create_rectangle(x0 - bx0, y0 - by0, x1 - bx0, y1 - by0, fill="#000000", outline="")
-        self._cut_img = None
-        if cut:     # the tooltip's letters become see-through holes in the shade
-            cl, ct, mask = cut
-            ox, oy = cl - bx0, ct - by0
-            h, w = box[3] - by0, box[2] - bx0
-            sub = np.zeros((h, w), bool)
-            ys, xs = max(0, -oy), max(0, -ox)
-            ye, xe = min(mask.shape[0], h - oy), min(mask.shape[1], w - ox)
-            if ye > ys and xe > xs:
-                sub[oy + ys:oy + ye, ox + xs:ox + xe] = mask[ys:ye, xs:xe]
-                rgba = np.zeros((h, w, 4), np.uint8)
-                rgba[sub] = (1, 2, 3, 255)          # KEY_COLOR: Windows leaves it transparent
-                self._cut_img = ImageTk.PhotoImage(Image.fromarray(rgba, "RGBA"))
-                self.scv.create_image(0, 0, image=self._cut_img, anchor="nw")
         if self.cover and self.cover != "all":
             l, t, r_, b = self.cover
             self.scv.create_rectangle(l - bx0, t - by0, r_ - bx0, b - by0, fill=KEY_COLOR, outline=KEY_COLOR, width=0)
