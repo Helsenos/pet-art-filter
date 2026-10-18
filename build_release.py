@@ -25,12 +25,10 @@ INSTALL_DIR = os.path.join(DESKTOP, "Pet Art Filter", "Pet Art Filter")
 WORK = os.path.join(os.environ.get("TEMP", HERE), "pafb")      # short path: PyInstaller hits 260-char limits
 APPDATA = os.path.join(os.environ.get("APPDATA", ""), "PetArtFilter")
 
-NOTES = """- Fix: sweeping fast could put the glow (and the market picture) of one pet art on the slot
-  next to it - the game draws the tooltip a moment late. The app now checks where the tooltip
-  is on screen and reads it again if it still belongs to the slot you just left
-- Reading speed setting (Settings): how long to wait on a slot before reading, 0-150 ms
-- Shade: not-good pet arts can be darkened with a see-through veil (darkness slider);
-  tooltips stay clear
+NOTES = """- Shade: the dark boxes stay dark under a tooltip - only its text shows through on top, so you
+  still see which pet arts are shaded (screen-recording mode keeps the old behaviour)
+- Results: the "Only good" switch now works on the whole list, and shows the good pet arts
+  with their tooltip picture. Click one to show it in the game and pick it for "Sell selected"
 """
 
 README = f"""PET ART FILTER {VER}  -  Metin2 Jintea
